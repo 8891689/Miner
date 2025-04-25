@@ -114,7 +114,7 @@ The miner requires a configuration file named config.json in the same directory 
   "wallet_address": "13HQ67Cqb8ZbfQThSAqX2RcXi6mhG69y39.pyworker",
   "threads": 1,
   "pool_password": "x",
-  "log_file": "miner_py.log"
+  "log_file": "miner.log"
 }
 ```
 
@@ -124,7 +124,7 @@ pool_host: (Required) The Stratum server address of your mining pool.
 
 pool_port: (Required) The Stratum port number for your mining pool.
 
-wallet_address: (Required) Crucial: Change this to your own wallet address (or wallet_address.worker_name format, depending on the pool).
+wallet_address: (required) Key: Change this to your own wallet address (or wallet_address.worker_name format, usually fill in the address directly without the miner name, it depends on you and the pool).
 
 threads: (Required) The number of CPU mining threads to use. Setting this to the number of your CPU's physical cores or logical threads is recommended.
 
