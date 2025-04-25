@@ -16,6 +16,9 @@ Bitcoin mining software, compatible with most platforms, supports multi-threadin
 5. pool_password Default: x
 6. Miner's Diary Default: miner_py.log
 
+In fact, you only need to replace the address in the configuration file with yours and you can run it directly.
+
+
 
 Please fill in the information above and install the necessary dependencies to run the program.
 
