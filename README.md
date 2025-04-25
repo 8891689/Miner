@@ -72,7 +72,7 @@ brew install curl json-c gmp
 
 If you are using the MSYS2 environment with a MinGW-w64 toolchain, you can install dependencies using pacman:
 
-# Run these in the MSYS2 MinGW 64-bit terminal
+Run these in the MSYS2 MinGW 64-bit terminal
 ```
 pacman -Syu
 pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-curl mingw-w64-x86_64-json-c mingw-w64-x86_64-gmp
@@ -80,7 +80,7 @@ pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-curl mingw-w64-x86_64-json
 
 (Note: pthreads is typically included in the MinGW toolchain, and ws2_32 is a Windows system library)
 
-Compilation
+# Compilation
 
 After installing the dependencies, compile the miner:
 
