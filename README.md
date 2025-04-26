@@ -166,5 +166,5 @@ Dogecoin: DTszb9cPALbG9ESNJMFJt4ECqWGRCgucky
 TRX: TAHUmjyzg7B3Nndv264zWYUhQ9HUmX4Xu4
 ```
 # 📜 Disclaimer
-Mining with CPUs (e.g. Bitcoin) is generally not very profitable due to the high network hashrate being dominated by ASIC miners. This software is primarily intended for educational purposes, testing, or mining coins with very low network difficulty.
+Using CPU to mine (such as Bitcoin) is usually not very profitable, because the high network computing power is mainly occupied by ASIC mining machines. This software is mainly used for educational purposes, testing or mining currencies with extremely low network difficulty. Unless you have free electricity, idle computer servers, routers, mobile phones and other equipment, you might as well try the SOLO mode. What if you win? There are also mini mining machines for sale, with power consumption of about 10W and calculation calendars ranging from 200G to 1.2T. The cheapest 200G calculation calendar only costs RMB 150. If you are interested, you can contact me.
 
