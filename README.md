@@ -86,17 +86,21 @@ After installing the dependencies, compile the miner:
 
 # Linux / macOS:
 ```
-g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner -std=c++11 -O3 -msse2 -mssse3 -lcurl -ljson-c -pthread -lm -lgmp
+g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner -O3 -march=native -lcurl -ljson-c -pthread -lm -lgmp
+
 ```
 
 # Windows (using MinGW-w64):
 ```
-g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner.exe -std=c++11 -O3 -msse2 -mssse3 -lcurl -ljson-c -lpthread -lm -lgmp -lws2_32
+g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner.exe -O3 -march=native -lcurl -ljson-c -lpthread -lm -lgmp -lws2_32
+
 ```
 ```
 -std=c++11: Specifies the C++ standard.
 
--O3: Enables optimizations.
+-march=native： General detection CPU instruction optimization compilation
+
+-O3: Enable level 3 optimizations. Unsupported computers will automatically downgrade to O2 Normal Optimization.
 
 -msse2 -mssse3: Enable the required CPU instruction sets.
 
