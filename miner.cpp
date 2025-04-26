@@ -1,5 +1,5 @@
 // miner.cpp
-// g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner -std=c++11 -O3 -msse2 -mssse3 -lcurl -ljson-c -pthread -lm -lgmp
+// g++ miner.cpp sha256.cpp sha256_sse.cpp -o miner -O3 -march=native -lcurl -ljson-c -pthread -lm -lgmp
 //author：8891689
 //Assist in creation：gemini
 #include "sha256.h"
