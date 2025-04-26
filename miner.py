@@ -5,857 +5,1447 @@
 import socket
 import json
 import time
-import hashlib
-import binascii
 import threading
-import logging
 import signal
 import sys
 import os
 import struct
+import hashlib
+import binascii
+import logging
+import math
+import random
 from datetime import datetime
-from math import log2, pow
-from collections import deque
-# Need select for non-blocking socket checks in subscribe thread
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
 try:
-    import select
+    import requests
 except ImportError:
-    print("Error: The 'select' module is required but not available on this platform.", file=sys.stderr)
+    print("Error: 'requests' library not found. Please install it using: pip install requests")
     sys.exit(1)
 
-# --- Configuration ---
+# --- Configuration Variables ---
+# Loaded from config.json
+g_pool_host = ""
+g_pool_port = 0
+g_wallet_addr = ""
+g_pool_password = "x"
+g_log_file = "miner.log"
+g_threads = 0
+
 CONFIG_FILE = "config.json"
-g_config = {
-    "pool_host": "stratum.example.com",
-    "pool_port": 3333,
-    "wallet_address": "YOUR_BTC_WALLET_ADDRESS",
-    "threads": 1,
-    "pool_password": "x",
-    "log_file": "miner_py.log"
-}
+RECONNECT_DELAY_SECONDS = 5
+STATUS_LOG_INTERVAL_SECONDS = 30
+
+# ANSI colors
+C_RED = "\x1b[31m"
+C_GREEN = "\x1b[32m"
+C_YELLOW = "\x1b[33m"
+C_MAG = "\x1b[35m"
+C_CYAN = "\x1b[36m"
+C_RESET = "\x1b[0m"
 
 # --- Global State ---
-g_sock = None
-g_sock_lock = threading.Lock()
-g_sigint_shutdown = threading.Event()
-g_connection_lost = threading.Event()
-g_new_job_available = threading.Condition() # Needs an underlying lock
+g_shutdown_event = threading.Event() # Replaces g_sigint_shutdown
+g_connection_lost_event = threading.Event() # Replaces g_connection_lost
 
-# Job Data (Protected by g_new_job_available lock)
-g_job_data = {
-    "job_id": None,
-    "prevhash": None, # bytes (little-endian)
-    "coinb1": None,   # bytes
-    "coinb2": None,   # bytes
-    "merkle_branch": [], # list of bytes (big-endian)
-    "version": None,  # int (little-endian host format)
-    "nbits": None,    # int (little-endian host format, parsed from BE hex)
-    "ntime": None,    # int (little-endian host format, parsed from BE hex)
-    "clean_jobs": False,
-    "extranonce1": None, # bytes
-    "extranonce2_size": 4, # int
-    "share_target": (2**256 - 1) // (2**32) # Initial Diff 1 target (approx)
-}
-g_current_height = -1 # Start at -1, update on first block change detect
+g_job_lock = threading.Lock() # Protects job data AND nbits/extranonce size
+g_new_job_condition = threading.Condition(g_job_lock) # Replaces g_new_job_cv
+g_new_job_available = False # Read/Written under g_job_lock
 
-# Hashrate Calculation
-g_hash_counts = deque(maxlen=120) # Store (timestamp, hashes) for ~2 minute window
+g_socket = None # Holds the current socket object
+g_socket_lock = threading.Lock() # Protect access to g_socket
+
+# Hashrate Calculation State
+g_thread_hash_counts = [] # List of hash counts per thread (integers)
+g_thread_hash_counts_lock = threading.Lock() # Protect the list structure if resizing
 g_total_hashes_reported = 0
-g_last_status_time = time.monotonic()
-g_status_lock = threading.Lock()
-g_shares_accepted = 0
-g_shares_rejected = 0
+g_aggregated_hash_rate = 0.0
+g_last_aggregated_report_time = time.monotonic()
 
-# --- Custom Colored Formatter ---
-class ColoredFormatter(logging.Formatter):
-    """A logging formatter that adds ANSI color codes based on log level."""
+# --- Stratum Job Data (Protected by g_job_lock) ---
+g_job_id = None
+g_prevhash_bin = b''  # Little Endian binary
+g_coinb1_bin = b''
+g_coinb2_bin = b''
+g_merkle_branch_bin_be = []  # List of Big Endian binary bytes
+g_version_le = 0  # Little Endian host format integer
+g_nbits_le = 0  # Little Endian host format integer (NETWORK nBits)
+g_ntime_le = 0  # Little Endian host format integer
+g_clean_jobs = False
 
-    # ANSI escape codes
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
+# --- Stratum Subscribe Data (Protected by g_job_lock) ---
+g_extranonce1_bin = b''
+g_extranonce2_size = 4  # Default, updated by subscribe response
 
-    # Basic Colors
-    BLACK = '\033[30m'
-    RED = '\033[31m'
-    GREEN = '\033[32m' # 綠色
-    YELLOW = '\033[33m'
-    BLUE = '\033[34m'
-    MAGENTA = '\033[35m' # 品紅色/紫紅色
-    CYAN = '\033[36m'
-    WHITE = '\033[37m'
+# --- Other Globals ---
+g_current_height = -1 # Block height, updated from API or job
+g_current_height_lock = threading.Lock()
 
-    # Define colors for log levels (Prefixes for the whole line)
-    LOG_LEVEL_COLORS = {
-        # DEBUG: 使用暗淡白色 (灰色)
-        logging.DEBUG:    DIM + WHITE,
-        # INFO: 使用綠色
-        logging.INFO:     GREEN,
-        # WARNING: 使用品紅色 (如果想更醒目但不用黃/紅)
-        logging.WARNING:  MAGENTA,
-        # ERROR: 使用標準紅色
-        logging.ERROR:    RED,
-        # CRITICAL: 使用粗體紅色
-        logging.CRITICAL: BOLD + RED,
-    }
+# Store 256-bit share target as Python int (Protected by g_share_target_lock)
+# Difficulty 1 target (0x00000000FFFF0000000000000000000000000000000000000000000000000000)
+TARGET1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+MAX_TARGET_256 = (1 << 256) - 1
+g_share_target = TARGET1
+g_share_target_lock = threading.Lock()
 
-    def __init__(self, fmt=None, datefmt=None, style='%', use_color=True):
-        super().__init__(fmt, datefmt, style)
-        self.use_color = use_color
+# --- Logger Setup ---
+# Setup logging (before first log message)
+log_formatter = logging.Formatter('[%(asctime)s.%(msecs)03d] [%(threadName)s] %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-    def format(self, record):
-        log_message = super().format(record) # Get standard formatted message
-        if self.use_color:
-            color_prefix = self.LOG_LEVEL_COLORS.get(record.levelno, self.WHITE) # Default to white
-            return f"{color_prefix}{log_message}{self.RESET}" # Add prefix and reset
-        else:
-            return log_message
-            
-# --- Logging Setup ---
-# Console shows INFO+, File shows INFO+ (or DEBUG+ if file_handler level changed)
-# Standard formatter for the file log
-log_formatter = logging.Formatter('[%(asctime)s.%(msecs)03d] [%(levelname)s][%(threadName)s] %(message)s', datefmt='%H:%M:%S')
-# Colored formatter for the console
-# Check if stderr is a TTY (supports color) before enabling color
-use_console_color = sys.stderr.isatty()
-console_formatter = ColoredFormatter('[%(asctime)s.%(msecs)03d] [%(levelname)s][%(threadName)s] %(message)s', datefmt='%H:%M:%S', use_color=use_console_color)
+# Prevent duplicate handlers if script is re-run in same process
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
 
-logger = logging.getLogger("Miner")
-logger.setLevel(logging.DEBUG) # Keep root logger level low
+# File Handler (configured later once g_log_file is known)
+file_handler = None
 
-# File Handler (Set level here, e.g., INFO or DEBUG)
-try:
-    file_handler = logging.FileHandler(g_config['log_file'], mode='a', encoding='utf-8')
-    file_handler.setFormatter(log_formatter) # <<< Use standard formatter
-    file_handler.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-except Exception as e:
-    print(f"Error setting up initial file logger: {e}", file=sys.stderr)
-    file_handler = None
-
-# Console Handler (Shows essential info: INFO and higher)
-console_handler = logging.StreamHandler(sys.stderr)
-console_handler.setFormatter(console_formatter) # <<< Use colored formatter
-console_handler.setLevel(logging.INFO)
-logger.addHandler(console_handler)
-
-# --- Constants ---
-DIFFICULTY_1_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-# --- How often the status thread logs the status line (in seconds) ---
-STATUS_LOG_INTERVAL_SECONDS = 30 # Log status every 30 seconds
-RECONNECT_DELAY_SECONDS = 5
+# Console Handler for stderr (for specific messages like status)
+# We will print directly to stderr/stdout for status/shares to match C++ style
+# console_handler = logging.StreamHandler(sys.stderr)
+# console_handler.setFormatter(log_formatter)
+# console_handler.setLevel(logging.INFO) # Or DEBUG
+# logger.addHandler(console_handler)
 
 # --- Helper Functions ---
 
-def bytes_to_hex(b: bytes) -> str:
-    return binascii.hexlify(b).decode('ascii') if b else ""
-
-def hex_to_bytes(h: str) -> bytes | None:
+def setup_file_logger():
+    """Sets up the file logger after config is loaded."""
+    global file_handler
+    if file_handler:
+        logger.removeHandler(file_handler)
     try:
-        return binascii.unhexlify(h) if h else None
-    except binascii.Error:
-        # Log at ERROR level, as this indicates bad data from pool or logic error
-        logger.error(f"Invalid hex string received: '{h}'")
+        file_handler = logging.FileHandler(g_log_file, mode='a') # Append mode
+        file_handler.setFormatter(log_formatter)
+        file_handler.setLevel(logging.INFO) # Log INFO and above to file
+        logger.addHandler(file_handler)
+        #logger.info(f"File logger initialized for '{g_log_file}'")
+    except Exception as e:
+        print(f"{C_RED}[!!! LOG FILE SETUP ERROR !!!] Cannot write to '{g_log_file}': {e}{C_RESET}", file=sys.stderr)
+        # Continue without file logging
+
+def log_msg(level, message):
+    """Logs message to file logger."""
+    # Map level for logging module if needed, or just use info/warning/error
+    if level == logging.INFO:
+        logger.info(message)
+    elif level == logging.WARNING:
+        logger.warning(message)
+    elif level == logging.ERROR:
+        logger.error(message)
+    elif level == logging.DEBUG:
+        logger.debug(message)
+    else: # Default to info
+        logger.info(message)
+
+def timestamp_us():
+    """Gets timestamp string with microseconds, matching C++ format."""
+    now = datetime.now()
+    return now.strftime('%H:%M:%S.%f')[:15] # Format H:M:S.us (6 digits)
+
+def bin_to_hex(binary_data):
+    """Converts bytes to hex string."""
+    return binascii.hexlify(binary_data).decode('ascii') if binary_data else ""
+
+def hex_to_bin(hex_string):
+    """Converts hex string to bytes. Returns None on error."""
+    if not hex_string or len(hex_string) % 2 != 0:
+        return None
+    try:
+        return binascii.unhexlify(hex_string)
+    except (binascii.Error, ValueError, TypeError):
+        # log_msg(logging.ERROR, f"[UTIL] hex_to_bin failed for input: {hex_string[:50]}...") # Avoid logging potentially huge strings
         return None
 
-def sha256d(data: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+def sha256_double_be(data_bytes):
+    """Performs double SHA256 and returns the result as big-endian bytes."""
+    first_hash = hashlib.sha256(data_bytes).digest()
+    second_hash = hashlib.sha256(first_hash).digest()
+    return second_hash # SHA256 result is naturally big-endian
 
-def reverse_bytes(b: bytes) -> bytes:
-    return b[::-1]
+def calculate_simplified_merkle_root_le(
+    coinb1_bin_param, extranonce1_bin_param,
+    extranonce2_bin_param, coinb2_bin_param,
+    merkle_branch_be_list_param):
+    """Calculates the Merkle Root and returns it as Little Endian bytes."""
+    # Construct full coinbase transaction binary
+    coinbase_tx_bin = (
+        coinb1_bin_param +
+        extranonce1_bin_param +
+        extranonce2_bin_param +
+        coinb2_bin_param
+    )
 
-def load_config() -> bool:
-    global g_config, logger, file_handler
-    if not os.path.exists(CONFIG_FILE):
-        logger.error(f"Config file '{CONFIG_FILE}' not found.")
+    # Double SHA256 the coinbase transaction -> Coinbase Hash (Big Endian)
+    current_hash_be = sha256_double_be(coinbase_tx_bin)
+
+    # Combine with merkle branches (provided in Big Endian)
+    for branch_hash_be in merkle_branch_be_list_param:
+        concat_be = current_hash_be + branch_hash_be
+        current_hash_be = sha256_double_be(concat_be) # New current hash (BE)
+
+    # Final result (current_hash_be) is the Merkle Root in Big Endian.
+    # Return it in Little Endian as needed for the block header.
+    merkle_root_le = current_hash_be[::-1] # Reverse bytes for LE
+    return merkle_root_le
+
+def is_hash_less_or_equal_target(hash_le_bytes, target_int):
+    """Checks if a 32-byte LE hash is <= the integer target."""
+    if not hash_le_bytes or len(hash_le_bytes) != 32:
+        return False
+    hash_int = int.from_bytes(hash_le_bytes, 'little')
+    return hash_int <= target_int
+
+# Difficulty calculation using nBits (from C++ logic)
+def calculate_difficulty_nbits(nbits_le_int):
+    """Calculates difficulty from nBits (Little Endian integer)."""
+    if nbits_le_int == 0: return 0.0
+    # Convert nBits (LE int) to BE bytes for easier parsing
+    try:
+        nbits_be_bytes = struct.pack('>I', nbits_le_int) # Pack as BE int
+        nbits_be_parsed = struct.unpack('>I', nbits_be_bytes)[0] # Unpack to ensure correct handling
+    except struct.error:
+        return 0.0 # Invalid nbits value
+
+    exponent = (nbits_be_parsed >> 24) & 0xFF
+    coefficient = nbits_be_parsed & 0x00FFFFFF
+
+    if coefficient == 0: return float('inf')
+    if exponent < 3 or exponent > 32: return 0.0 # Invalid exponent
+
+    # Difficulty 1 target (0x1d00ffff) values -> Target1 int already defined
+    # target = coefficient * 2^(8*(exponent-3))
+    # difficulty = TARGET1 / target
+    try:
+        target = coefficient * (2**(8 * (exponent - 3)))
+        if target == 0: return float('inf')
+        # Use floating point for potentially large division result
+        difficulty = float(TARGET1) / float(target)
+        return difficulty
+    except OverflowError:
+        # Calculation might exceed standard float limits, use simplified ratio
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                example_config = {
-                    "pool_host": "stratum.example.com", "pool_port": 3333,
-                    "wallet_address": "YOUR_BTC_WALLET_ADDRESS.WorkerName",
-                    "threads": 1, "pool_password": "x", "log_file": "miner_py.log"
+             diff1_coeff = 0x00ffff
+             diff1_exp = 0x1d # 29
+             diff1_exp_shift = 8 * (diff1_exp - 3)
+             current_exp_shift = 8 * (exponent - 3)
+             difficulty = (float(diff1_coeff) / float(coefficient)) * math.pow(2.0, diff1_exp_shift - current_exp_shift)
+             return difficulty
+        except (OverflowError, ValueError):
+             return float('inf') # Or some other indicator of extreme difficulty
+    except Exception:
+        return 0.0 # Other errors
+
+# Calculate difficulty from a 256-bit target integer
+def calculate_difficulty_from_target(target_int):
+    """Calculates difficulty from a 256-bit integer target."""
+    if target_int <= 0:
+        # Target is zero or negative, difficulty is effectively infinite
+        log_msg(logging.WARNING, "[UTIL] calculate_difficulty_from_target: Target is non-positive.")
+        return float('inf')
+    try:
+        # Difficulty = target1 / target_current
+        # Use floating point for potentially large/small ratios
+        difficulty = float(TARGET1) / float(target_int)
+        return difficulty
+    except OverflowError:
+        return float('inf') # Target extremely small
+    except Exception as e:
+        log_msg(logging.ERROR, f"[UTIL] Exception during difficulty calculation from target: {e}")
+        return 0.0 # Indicate error
+
+def uint32_to_hex_be(val_le_int):
+    """Convert uint32_t (Little Endian host int) to Big Endian hex string."""
+    try:
+        # Pack as little-endian, unpack as big-endian, then format
+        be_int = struct.unpack('>I', struct.pack('<I', val_le_int))[0]
+        return f"{be_int:08x}"
+    except struct.error:
+        return "00000000" # Error case
+
+def increment_extranonce2(enonce2_bytearray):
+    """Increments the extranonce2 bytearray (Little Endian)."""
+    if not enonce2_bytearray:
+        return False # Nothing to increment
+
+    size = len(enonce2_bytearray)
+    for i in range(size):
+        if enonce2_bytearray[i] == 0xff:
+            enonce2_bytearray[i] = 0
+            # Continue to carry to the next byte
+        else:
+            enonce2_bytearray[i] += 1
+            return True # Increment successful without full wrap
+
+    # If we exit the loop, all bytes wrapped around
+    return False # Indicates full wrap around
+
+# --- Config Loading ---
+def load_config():
+    global g_pool_host, g_pool_port, g_wallet_addr, g_threads
+    global g_pool_password, g_log_file
+
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config_content = f.read()
+    except FileNotFoundError:
+        print(f"{C_RED}[ERROR] Config file '{CONFIG_FILE}' not found.{C_RESET}", file=sys.stderr)
+        # Create example config
+        try:
+            with open(CONFIG_FILE, 'w') as f_example:
+                example_json = {
+                    "pool_host": "stratum.example.com",
+                    "pool_port": 3333,
+                    "wallet_address": "YOUR_BTC_WALLET_ADDRESS",
+                    "threads": 4,
+                    "pool_password": "x",
+                    "log_file": "miner.log"
                 }
-                json.dump(example_config, f, indent=2)
-            logger.info(f"Created example config file '{CONFIG_FILE}'. Please edit it.")
-        except Exception as e: logger.error(f"Could not create example config file: {e}")
+                json.dump(example_json, f_example, indent=2)
+            print(f"[INFO] Created example config file '{CONFIG_FILE}'. Please edit it with your details.", file=sys.stderr)
+        except Exception as e:
+            print(f"{C_RED}[ERROR] Could not create example config file '{CONFIG_FILE}': {e}{C_RESET}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"{C_RED}[ERROR] Failed to read config file '{CONFIG_FILE}': {e}{C_RESET}", file=sys.stderr)
+        return False
+
+    if not config_content:
+        print(f"{C_RED}[ERROR] Config file '{CONFIG_FILE}' is empty.{C_RESET}", file=sys.stderr)
         return False
 
     try:
-        with open(CONFIG_FILE, 'r') as f: loaded_config = json.load(f)
-        required_keys = ["pool_host", "pool_port", "wallet_address", "threads"]
-        for key in required_keys:
-            if key not in loaded_config: raise ValueError(f"Missing required key: '{key}'")
-        if not isinstance(loaded_config["pool_port"], int) or not (0 < loaded_config["pool_port"] < 65536): raise ValueError("Invalid pool_port")
-        if not isinstance(loaded_config["threads"], int) or loaded_config["threads"] <= 0: raise ValueError("Invalid threads value")
-        if not loaded_config["wallet_address"] or loaded_config["wallet_address"] == "YOUR_BTC_WALLET_ADDRESS.WorkerName": raise ValueError("Invalid wallet_address")
+        config = json.loads(config_content)
+    except json.JSONDecodeError as e:
+        print(f"{C_RED}[ERROR] Failed to parse JSON from config file '{CONFIG_FILE}'. Check syntax: {e}{C_RESET}", file=sys.stderr)
+        return False
 
-        g_config.update(loaded_config)
-
-        if file_handler and g_config['log_file'] != file_handler.baseFilename:
-             #logger.info(f"Log file changing from {file_handler.baseFilename}")
-             logger.removeHandler(file_handler)
-             file_handler.close()
-             try:
-                 file_handler = logging.FileHandler(g_config['log_file'], mode='a', encoding='utf-8')
-                 file_handler.setFormatter(log_formatter)
-                 file_handler.setLevel(logging.INFO) # Reset level on new handler
-                 logger.addHandler(file_handler)
-                 logger.info(f"Log file set to: {g_config['log_file']}")
-             except Exception as e:
-                logger.error(f"Error setting up new file logger '{g_config['log_file']}': {e}")
-                file_handler = None
-        logger.info("Configuration loaded successfully.")
-        return True
-    except json.JSONDecodeError as e: logger.error(f"Failed to parse JSON from '{CONFIG_FILE}': {e}"); return False
-    except ValueError as e: logger.error(f"Invalid configuration in '{CONFIG_FILE}': {e}"); return False
-    except Exception as e: logger.error(f"Error loading config from '{CONFIG_FILE}': {e}"); return False
-
-def calculate_difficulty_from_nbits(nbits_le: int) -> float:
-    """Calculates difficulty from nBits (which is stored in host little-endian format)."""
-    # DEBUG log added to see the input value
-    logger.debug(f"Calculating diff from nbits_le: {nbits_le:08x}")
-    if nbits_le == 0:
-        logger.debug("nbits_le is 0, returning 0.0 diff")
-        return 0.0
-
-    # Convert nbits (assumed LE host format) to BE bytes for parsing exponent/coeff
+    # Validate and load settings
+    error_field = ""
     try:
-        nbits_be_bytes = nbits_le.to_bytes(4, 'little')
-    except OverflowError:
-         logger.error(f"nbits value {nbits_le:08x} too large to fit in 4 bytes LE.")
-         return 0.0
-    nbits_be = int.from_bytes(nbits_be_bytes, 'big')
+        g_pool_host = config.get("pool_host")
+        if not isinstance(g_pool_host, str) or not g_pool_host:
+            error_field = "pool_host (must be a non-empty string)"
+            raise ValueError()
 
-    exponent = (nbits_be >> 24) & 0xFF
-    coefficient = nbits_be & 0x00FFFFFF
-    # DEBUG log added for intermediate values
-    logger.debug(f"nBits BE: {nbits_be:08x}, Exponent: {exponent}, Coefficient: {coefficient}")
+        g_pool_port = config.get("pool_port")
+        if not isinstance(g_pool_port, int) or not (0 < g_pool_port <= 65535):
+            error_field = "pool_port (must be an integer between 1 and 65535)"
+            raise ValueError()
 
-    # Reference: https://en.bitcoin.it/wiki/Difficulty#What_is_the_formula_for_difficulty
-    if coefficient == 0 or not (3 <= exponent <= 32): # Bitcoin mainnet nbits constraints
-        logger.warning(f"Invalid nBits exponent({exponent})/coefficient({coefficient}) derived from LE {nbits_le:08x}, returning 0.0 diff")
-        return 0.0 # Invalid nBits format
+        g_wallet_addr = config.get("wallet_address")
+        if not isinstance(g_wallet_addr, str) or not g_wallet_addr or g_wallet_addr == "YOUR_BTC_WALLET_ADDRESS":
+            error_field = "wallet_address (must be a non-empty string, not the example)"
+            raise ValueError()
 
-    # target = coefficient * 2**(8*(exponent-3))
+        g_threads = config.get("threads")
+        if not isinstance(g_threads, int) or g_threads <= 0:
+            error_field = "threads (must be a positive integer)"
+            raise ValueError()
+
+        # Optional fields
+        g_pool_password = config.get("pool_password", "x") # Default "x"
+        if not isinstance(g_pool_password, str):
+            error_field = "pool_password (must be a string if provided)"
+            raise ValueError()
+
+        g_log_file = config.get("log_file", "miner.log") # Default "miner.log"
+        if not isinstance(g_log_file, str) or not g_log_file:
+            g_log_file = "miner.log" # Force default if empty string given
+
+    except ValueError:
+        print(f"{C_RED}[ERROR] Invalid or missing configuration in '{CONFIG_FILE}': Check field '{error_field}'.{C_RESET}", file=sys.stderr)
+        return False
+    except Exception as e:
+         print(f"{C_RED}[ERROR] Unexpected error loading config: {e}{C_RESET}", file=sys.stderr)
+         return False
+
+    print(f"[CONFIG] Configuration successfully loaded and validated from {CONFIG_FILE}")
+    return True
+
+# --- Signal Handler ---
+def handle_sigint(sig, frame):
+    if g_shutdown_event.is_set():
+        return # Already shutting down
+    print(f"\r{' '*80}\r{C_YELLOW}[SIGNAL] Shutdown initiated by SIGINT...{C_RESET}", file=sys.stderr)
+    sys.stderr.flush()
+    log_msg(logging.INFO,"[SIGNAL] SIGINT received, initiating shutdown...")
+    g_shutdown_event.set()
+    # Signal connection loss as well to break loops
+    g_connection_lost_event.set()
+    # Wake up any waiting threads
+    with g_job_lock:
+        g_new_job_condition.notify_all()
+
+# --- Networking & Pool Communication ---
+
+# Get current block height from an external API
+def get_current_block_height():
+    # Using mempool.space API as an example
+    url = "https://mempool.space/api/blocks/tip/height"
+    headers = {'User-Agent': 'SimplePythonMiner/1.0'}
     try:
-        target = coefficient * (2**(8 * (exponent - 3)))
-    except OverflowError:
-        logger.error(f"Target calculation overflowed: coeff={coefficient} exp={exponent}")
-        return float('inf') # Or perhaps 0.0 depending on desired handling
+        response = requests.get(url, timeout=10, headers=headers)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        height = int(response.text)
+        return height
+    except requests.exceptions.RequestException as e:
+        log_msg(logging.ERROR, f"[HTTP] Failed to get block height from {url}: {e}")
+    except (ValueError, TypeError) as e:
+         log_msg(logging.ERROR, f"[HTTP] Failed to parse height response '{response.text[:100]}': {e}")
+    except Exception as e:
+         log_msg(logging.ERROR, f"[HTTP] Unknown error getting block height: {e}")
+    return -1
 
-    # difficulty = difficulty_1_target / target
-    difficulty = float(DIFFICULTY_1_TARGET) / target if target != 0 else float('inf')
-    logger.debug(f"Calculated Target: {target}, Difficulty: {difficulty}")
-    return difficulty
-
-def calculate_difficulty_from_target(target: int) -> float:
-    if target <= 0: return float('inf')
-    difficulty = float(DIFFICULTY_1_TARGET) / target
-    return difficulty
-
-def calculate_target_from_difficulty(difficulty: float) -> int:
-    if difficulty <= 0: return 2**256 - 1
-    target = int(DIFFICULTY_1_TARGET / difficulty)
-    max_target = 2**256 - 1
-    return min(target, max_target)
-
-def handle_sigint(signum, frame):
-    if not g_sigint_shutdown.is_set():
-        # No direct print needed, logger handles console output
-        logger.warning("SIGINT received, initiating shutdown...")
-        g_sigint_shutdown.set()
-        with g_new_job_available: g_new_job_available.notify_all()
-        g_connection_lost.set()
-        close_socket()
-
-def connect_pool() -> socket.socket | None:
-    host = g_config["pool_host"]; port = g_config["pool_port"]
-    logger.info(f"Resolving {host}:{port}...")
+# Connect to the mining pool
+def connect_pool():
+    """Tries to connect to the pool. Returns socket object or None."""
+    log_msg(logging.INFO, f"[NET] Resolving {g_pool_host}:{g_pool_port}...")
+    sock = None
     try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        if not addr_info: logger.error(f"Could not resolve {host}"); return None
-        sock = None; last_error = None
-        for res in addr_info:
-            af, socktype, proto, _, sa = res
+        # getaddrinfo handles IPv4/IPv6 resolution
+        addr_info_list = socket.getaddrinfo(g_pool_host, g_pool_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+
+        if not addr_info_list:
+             log_msg(logging.ERROR, f"[ERROR][NET] getaddrinfo failed for {g_pool_host} (no results)")
+             return None
+
+        for res in addr_info_list:
+            af, socktype, proto, canonname, sa = res
             try:
-                sock = socket.socket(af, socktype, proto); sock.settimeout(10)
-                logger.info(f"Attempting connect to {sa[0]}:{sa[1]}...")
-                sock.connect(sa); sock.settimeout(None); return sock
-            except socket.error as e: last_error = e; logger.warning(f"Connect attempt failed to {sa[0]}: {e}")
-            except Exception as e: last_error = e; logger.warning(f"Connect attempt failed to {sa[0]} (non-socket error): {e}")
-            if sock: sock.close(); sock = None
-        logger.error(f"Failed to connect to any resolved address for {host}:{port}. Last error: {last_error}"); return None
-    except socket.gaierror as e: logger.error(f"DNS resolution failed for {host}: {e}"); return None
-    except Exception as e: logger.error(f"Unexpected error during connect_pool: {e}"); return None
-
-def close_socket():
-    global g_sock
-    with g_sock_lock:
-        if g_sock:
-            logger.debug(f"Closing socket FD {g_sock.fileno()}")
-            try: g_sock.shutdown(socket.SHUT_RDWR)
-            except socket.error: pass
-            try: g_sock.close()
-            except socket.error: pass
-            g_sock = None
-
-def send_json_rpc(sock: socket.socket, method: str, params: list, req_id: int) -> bool:
-    if not sock: logger.error("send_json_rpc attempted on null socket."); return False
-    try:
-        payload = {"id": req_id, "method": method, "params": params}
-        message = json.dumps(payload) + "\n"
-        logger.debug(f"Sending: {message.strip()}")
-        sock.sendall(message.encode('utf-8')); return True
-    except socket.error as e: logger.error(f"Socket error sending JSON RPC ({method}): {e}")
-    except Exception as e: logger.error(f"Error sending JSON RPC ({method}): {e}")
-    # If sending fails, signal connection loss
-    g_connection_lost.set();
-    with g_new_job_available: g_new_job_available.notify_all()
-    close_socket(); return False
-
-# --- Subscribe Thread ---
-def subscribe_thread_func():
-    global g_shares_accepted, g_shares_rejected, g_current_height
-    thread_name = threading.current_thread().name
-    logger.info("Subscribe thread started.")
-    receive_buffer = b""
-    message_id_counter = 1
-    current_sock = None
-
-    with g_sock_lock:
-        current_sock = g_sock
-        if current_sock:
-             try:
-                 current_sock.setblocking(False) # Use non-blocking for select()
-             except socket.error as e:
-                 logger.error(f"Failed to set socket non-blocking: {e}")
-                 g_connection_lost.set() # Can't proceed if this fails
-                 current_sock = None # Mark as unusable
-
-    if not current_sock:
-         logger.error("Subscribe thread started with no valid/usable socket.")
-         # Ensure main loop knows connection is lost if socket setup failed
-         g_connection_lost.set()
-         with g_new_job_available: g_new_job_available.notify_all()
-         return
-
-    subscribed = False
-    authorized = False
-    sub_id = -1
-    auth_id = -1
-
-    # Initial subscribe/authorize sequence
-    try:
-        message_id_counter = 1
-        sub_id = message_id_counter; message_id_counter += 1
-        auth_id = message_id_counter; message_id_counter += 1
-
-        logger.info(f"Sending subscribe request (ID {sub_id})...")
-        if not send_json_rpc(current_sock, "mining.subscribe", ["SimplePythonMiner/0.1.2"], sub_id):
-             raise ConnectionError("Failed to send subscribe") # Raise to exit thread
-
-        logger.info(f"Sending authorize request (ID {auth_id})...")
-        if not send_json_rpc(current_sock, "mining.authorize", [g_config["wallet_address"], g_config["pool_password"]], auth_id):
-            raise ConnectionError("Failed to send authorize") # Raise to exit thread
-
-        logger.info("Waiting for pool responses/notifications...")
-
-    except ConnectionError as e:
-         logger.error(f"Initial connection setup failed: {e}")
-         # Flags/socket closure handled by send_json_rpc or connect_pool
-         return # Exit thread
-
-    # --- Receive Loop using select() ---
-    while not g_sigint_shutdown.is_set() and not g_connection_lost.is_set():
-        readable = []
-        exceptional = []
-        with g_sock_lock:
-            if not g_sock: # Check if socket closed by another thread
-                logger.warning("Socket closed externally, ending subscribe loop.")
-                g_connection_lost.set(); break
-            try:
-                # Check socket status with timeout
-                readable, _, exceptional = select.select([current_sock], [], [current_sock], 1.0)
-            except ValueError: # Socket might have been closed between lock release and select
-                logger.warning("Socket closed before select() call.")
-                g_connection_lost.set(); break
-            except Exception as e:
-                logger.error(f"Error during select(): {e}")
-                g_connection_lost.set(); break
-
-        if exceptional: logger.error("Socket exceptional condition detected."); g_connection_lost.set(); break
-
-        if readable:
-            try:
-                chunk = current_sock.recv(8192)
-                if not chunk:
-                    logger.warning(f"Pool disconnected FD {current_sock.fileno()} (read 0 bytes).")
-                    g_connection_lost.set(); break
-                receive_buffer += chunk
-
-                while b'\n' in receive_buffer:
-                    line, receive_buffer = receive_buffer.split(b'\n', 1)
-                    line = line.strip()
-                    if not line: continue
-                    logger.debug(f"Received raw: {line.decode('utf-8', errors='replace')}")
-                    try:
-                        data = json.loads(line)
-                        msg_id = data.get('id'); method = data.get('method'); result = data.get('result'); error_info = data.get('error')
-
-                        # --- Process Responses ---
-                        if msg_id is not None:
-                            if error_info:
-                                logger.error(f"Pool error response ID {msg_id}: {error_info}")
-                                if msg_id == sub_id: logger.critical("SUBSCRIBE FAILED (Pool Error)."); g_connection_lost.set(); break
-                                if msg_id == auth_id: logger.critical(f"AUTHORIZATION FAILED: {error_info}. Check wallet/password."); g_connection_lost.set(); break
-                                if isinstance(msg_id, int) and msg_id >= 100:
-                                     logger.warning(f"Share REJECTED by pool (ID {msg_id}): {error_info}")
-                                     with g_status_lock: g_shares_rejected += 1
-                            elif result is not None or 'result' in data:
-                                if msg_id == sub_id:
-                                    if isinstance(result, list) and len(result) >= 3:
-                                        e1_hex = result[1]; e2_size = result[2]; e1_bytes = hex_to_bytes(e1_hex)
-                                        if e1_bytes is not None and isinstance(e2_size, int):
-                                            with g_new_job_available:
-                                                g_job_data["extranonce1"] = e1_bytes
-                                                g_job_data["extranonce2_size"] = e2_size
-                                            logger.info(f"Subscribe successful. E1: {e1_hex} ({len(e1_bytes)}B), E2Size: {e2_size}")
-                                            subscribed = True
-                                        else: logger.error(f"Invalid subscribe response format (E1/E2Size): {result}"); g_connection_lost.set(); break
-                                    else: logger.error(f"Invalid subscribe response structure: {result}"); g_connection_lost.set(); break
-                                elif msg_id == auth_id:
-                                    auth_ok = result is True or result is None
-                                    if auth_ok: logger.info("Authorization successful."); authorized = True
-                                    else: logger.critical("AUTHORIZATION FAILED (result false/non-null). Check wallet/password."); g_connection_lost.set(); break
-                                elif isinstance(msg_id, int) and msg_id >= 100:
-                                    share_accepted = result is True or result is None
-                                    if share_accepted: logger.info(f"Share accepted by pool (ID {msg_id})."); g_shares_accepted += 1
-                                    else: logger.warning(f"Share likely rejected by pool (ID {msg_id}). Result: {result}"); g_shares_rejected += 1
-                                else: logger.warning(f"Received success result for unexpected ID: {msg_id}")
-                            else: logger.warning(f"Response ID {msg_id} with no 'result'/'error' field.")
-
-                        # --- Process Notifications ---
-                        elif method:
-                            params = data.get('params', [])
-                            if method == 'mining.notify':
-                                if not subscribed or not authorized: logger.warning("Ignoring mining.notify before sub/auth complete."); continue
-                                if len(params) >= 9:
-                                    job_id, ph_hex, cb1_hex, cb2_hex, mb_hex_list, ver_hex, nbits_hex, ntime_hex, clean = params[:9]
-                                    # Add DEBUG log to see raw nbits hex string from pool
-                                    logger.debug(f"Job {job_id}: Received nbits_hex='{nbits_hex}'")
-                                    ph_bytes = hex_to_bytes(ph_hex); cb1_bytes = hex_to_bytes(cb1_hex); cb2_bytes = hex_to_bytes(cb2_hex)
-                                    mb_bytes_list = [hex_to_bytes(h) for h in mb_hex_list]
-                                    ver_bytes = hex_to_bytes(ver_hex); nbits_bytes = hex_to_bytes(nbits_hex); ntime_bytes = hex_to_bytes(ntime_hex)
-
-                                    # Check for conversion errors BEFORE calculating int values
-                                    required_bytes = [ph_bytes, cb1_bytes, cb2_bytes, ver_bytes, nbits_bytes, ntime_bytes]
-                                    if None in required_bytes or None in mb_bytes_list:
-                                        logger.error(f"Failed to convert hex in mining.notify job {job_id}. Discarding. Check previous ERROR logs for bad hex.")
-                                        continue # Skip this job if any hex failed
-
-                                    if len(ph_bytes) != 32 or any(len(mb) != 32 for mb in mb_bytes_list if mb):
-                                        logger.error(f"Incorrect hash length in mining.notify job {job_id}. Discarding.")
-                                        continue
-
-                                    # Convert BE hex bytes to host integer (usually LE host)
-                                    try:
-                                        version_int = int.from_bytes(ver_bytes, 'big')
-                                        nbits_int   = int.from_bytes(nbits_bytes, 'big') # Parsed as big-endian number
-                                        ntime_int   = int.from_bytes(ntime_bytes, 'big')
-                                    except Exception as e:
-                                         logger.error(f"Error converting version/nbits/ntime bytes to int for job {job_id}: {e}")
-                                         continue
-
-                                    # Store nbits value as parsed (big-endian int) for later conversion to LE for difficulty calc
-                                    # Let's adjust: Store the nbits value intended for the block header (usually LE on wire, BE hex in stratum)
-                                    # Standard nbits in stratum is BE hex. Parsing with int.from_bytes(bytes.fromhex(hex_str), 'big') gives the numerical value.
-                                    # For difficulty calculation, we need the LE representation of this numerical value.
-                                    # Let's store the numerical value (nbits_int) and convert to LE inside calculate_difficulty.
-                                    # *** Correction: The `calculate_difficulty_from_nbits` function expects the host's little-endian integer representation.
-                                    # So, we need to convert the big-endian value `nbits_int` to little-endian.
-                                    nbits_le_host_int = int.from_bytes(nbits_int.to_bytes(4, 'big'), 'little')
-
-                                    prevhash_le_bytes = reverse_bytes(ph_bytes)
-                                    merkle_branch_be_bytes = mb_bytes_list # Store as received (BE bytes)
-
-                                    net_diff = calculate_difficulty_from_nbits(nbits_le_host_int) # Use LE representation
-
-                                    with g_new_job_available:
-                                        is_new_block = g_job_data["prevhash"] != prevhash_le_bytes
-                                        old_job_id = g_job_data["job_id"]
-                                        g_job_data.update({
-                                            "job_id": job_id, "prevhash": prevhash_le_bytes,
-                                            "coinb1": cb1_bytes, "coinb2": cb2_bytes,
-                                            "merkle_branch": merkle_branch_be_bytes,
-                                            "version": version_int,
-                                            "nbits": nbits_le_host_int, # Store LE host int
-                                            "ntime": ntime_int,
-                                            "clean_jobs": bool(clean)
-                                        })
-                                        g_new_job_available.notify_all()
-
-                                    if is_new_block and old_job_id is not None:
-                                        if g_current_height < 0: g_current_height = 1 # Estimate starts
-                                        else: g_current_height += 1
-                                        logger.info(f"[*] New Block ~{g_current_height}. Job: {job_id} (Clean:{clean}, NetDiff:{net_diff:.3e})")
-                                    else:
-                                        logger.info(f"New Job: {job_id} (Clean:{clean}, NetDiff:{net_diff:.3e})") # Log NetDiff here too
-
-                                else: logger.warning(f"Received mining.notify with wrong number of params: {len(params)}")
-
-                            elif method == 'mining.set_difficulty':
-                                if len(params) >= 1:
-                                    pool_difficulty = params[0]
-                                    if isinstance(pool_difficulty, (int, float)) and pool_difficulty > 0:
-                                         new_target = calculate_target_from_difficulty(float(pool_difficulty))
-                                         with g_new_job_available: g_job_data["share_target"] = new_target
-                                         actual_share_diff = calculate_difficulty_from_target(new_target)
-                                         # Shorten target display in log
-                                         target_hex = f"{new_target:064x}"
-                                         short_target_hex = f"{target_hex[:6]}...{target_hex[-6:]}" if len(target_hex) > 12 else target_hex
-                                         logger.info(f"Pool difficulty set to: {pool_difficulty:.1f} -> Share Target: {short_target_hex} (Share Diff: {actual_share_diff:.1f})")
-                                    else: logger.warning(f"Ignoring invalid difficulty value: {pool_difficulty}")
-                                else: logger.warning("Received mining.set_difficulty with no params.")
-                            else: logger.warning(f"Received unknown notification method: {method}")
-                        else: logger.warning(f"Received message with no ID and no method: {data}")
-
-                    except json.JSONDecodeError: logger.error(f"JSON decode error for line: {line.decode('utf-8', errors='replace')}")
-                    except Exception as e: logger.exception(f"Error processing message: {line.decode('utf-8', errors='replace')}")
+                log_msg(logging.INFO, f"[NET] Attempting connect to {g_pool_host} ({sa[0]}) port {sa[1]}...")
+                sock = socket.socket(af, socktype, proto)
+                sock.settimeout(10) # 10 second connection timeout
+                sock.connect(sa)
+                sock.settimeout(None) # Set back to blocking for normal operation
+                log_msg(logging.INFO, f"[NET] Successfully connected to {g_pool_host}:{g_pool_port} via {sa[0]}")
+                return sock # Return the connected socket
 
             except socket.error as e:
-                if e.errno != socket.errno.EAGAIN and e.errno != socket.errno.EWOULDBLOCK:
-                    logger.error(f"Socket error receiving data: {e}")
-                    g_connection_lost.set(); break
-            except Exception as e: logger.exception("Unexpected error processing received data."); g_connection_lost.set(); break
+                log_msg(logging.WARNING, f"[WARN][NET] connect() to {sa[0]} failed: {e}")
+                if sock:
+                    sock.close()
+                sock = None
+                continue # Try next address
+            except Exception as e:
+                log_msg(logging.ERROR, f"[ERROR][NET] Unexpected error during connect attempt: {e}")
+                if sock:
+                    sock.close()
+                sock = None
+                continue
 
-        if g_connection_lost.is_set() or g_sigint_shutdown.is_set(): break # Exit loop if flags set
+        # If loop completes without returning a socket
+        log_msg(logging.ERROR, f"[ERROR][NET] Failed to connect to any resolved address for {g_pool_host}:{g_pool_port}")
+        return None
 
-    # --- End of Receive Loop ---
-    logger.info("Subscribe thread finishing.")
-    if g_connection_lost.is_set(): close_socket()
-    with g_new_job_available: g_new_job_available.notify_all()
+    except socket.gaierror as e:
+        log_msg(logging.ERROR, f"[ERROR][NET] getaddrinfo failed for {g_pool_host}: {e}")
+        return None
+    except Exception as e:
+        log_msg(logging.ERROR, f"[ERROR][NET] Unexpected error during connection setup: {e}")
+        return None
+
+# Send JSON string over socket
+def send_json_message(sock, message_dict):
+    """Sends a JSON message dictionary over the socket."""
+    if not sock:
+        log_msg(logging.ERROR, "[ERROR][NET] send_json attempted on None socket.")
+        return False
+    try:
+        msg = json.dumps(message_dict) + '\n'
+        sock.sendall(msg.encode('utf-8')) # sendall handles partial sends
+        # log_msg(logging.DEBUG, f"[DEBUG][NET] Sent: {msg.strip()}") # Optional debug log
+        return True
+    except socket.error as e:
+        log_msg(logging.ERROR, f"[ERROR][NET] sendall() failed on socket: {e}")
+        g_connection_lost_event.set() # Signal connection loss
+        with g_job_lock:
+            g_new_job_condition.notify_all()
+        return False
+    except (TypeError, json.JSONDecodeError) as e:
+         log_msg(logging.ERROR, f"[ERROR][NET] Failed to encode JSON for sending: {e} - Data: {message_dict}")
+         return False
+    except Exception as e:
+        log_msg(logging.ERROR, f"[ERROR][NET] Unexpected error sending JSON: {e}")
+        g_connection_lost_event.set()
+        with g_job_lock:
+            g_new_job_condition.notify_all()
+        return False
 
 
 # --- Miner Thread ---
-def miner_thread_func(thread_id: int, num_threads: int):
-    """Hashes potential blocks and submits shares."""
-    thread_name = threading.current_thread().name
-    logger.info(f"Miner thread {thread_id} started.")
-    local_hashes = 0
-    last_hash_report_time = time.monotonic()
+def miner_func(thread_id, num_threads):
+    """Main function for each miner thread."""
+    global g_new_job_available
 
-    while not g_sigint_shutdown.is_set():
-        job = None; target = 0; e1 = b''; e2_size = 4; current_job_id = None
+    thread_name = f"Miner-{thread_id}"
+    threading.current_thread().name = thread_name
+    log_msg(logging.INFO, f"[MINER {thread_id}] Thread started.")
 
-        with g_new_job_available:
-            while not g_sigint_shutdown.is_set() and not g_connection_lost.is_set() and g_job_data["job_id"] is None:
-                g_new_job_available.wait(timeout=1.0)
-            if g_sigint_shutdown.is_set() or g_connection_lost.is_set(): break # Exit thread loop
-            if g_job_data["job_id"] is None or not g_job_data["extranonce1"] or g_job_data["share_target"] == 0:
-                # logger.debug(f"Miner {thread_id} woke up but job invalid/incomplete. Re-waiting.")
-                continue # Go back to waiting
+    # Thread-local state variables
+    current_job_id_local = None
+    extranonce2_size_local = 4
+    extranonce2_bin_local = bytearray() # Use bytearray for mutability
 
-            # Copy job data under lock
-            job = g_job_data.copy(); target = g_job_data["share_target"]
-            e1 = g_job_data["extranonce1"]; e2_size = g_job_data["extranonce2_size"]
-            current_job_id = job["job_id"]
+    # Local copy of share target
+    local_share_target = 0 # Initialize to 0
+    share_target_loaded = False
 
-        logger.debug(f"Miner {thread_id} starting job {current_job_id} (E2Size: {e2_size}, Tgt: {target:064x})")
-        job_abandoned_by_thread = False
-        extranonce2 = bytearray(e2_size)
-        if e2_size > 0:
-            start_val_limited = thread_id % (2**(8*e2_size))
-            start_val_bytes = start_val_limited.to_bytes(e2_size, 'little', signed=False)
-            extranonce2 = bytearray(start_val_bytes)
+    # Initialize hash counter for this thread
+    with g_thread_hash_counts_lock:
+        if thread_id >= len(g_thread_hash_counts):
+             log_msg(logging.ERROR, f"[MINER {thread_id}] Error: thread_id out of range for hash counts.")
+             return
+        g_thread_hash_counts[thread_id] = 0 # Initialize count
 
-        e2_stride = num_threads
-        e2_iterations = 0
-        MAX_E2_ITERATIONS = 2**(8*e2_size) if 0 < e2_size <= 4 else (2**32 if e2_size > 4 else 1)
-        if e2_size == 0: extranonce2 = b""; MAX_E2_ITERATIONS = 1
 
-        # --- Extranonce2 Iteration Loop ---
-        while e2_iterations < MAX_E2_ITERATIONS and not job_abandoned_by_thread and not g_sigint_shutdown.is_set() and not g_connection_lost.is_set():
-            if e2_iterations > 0: # Increment E2 after the first iteration
-                i = 0; carry = e2_stride
-                while i < e2_size and carry > 0:
-                    new_val = int(extranonce2[i]) + carry
-                    extranonce2[i] = new_val & 0xFF; carry = new_val >> 8; i += 1
-                if carry > 0 and i >= e2_size:
-                    logger.warning(f"Miner {thread_id} exhausted its extranonce2 range for job {current_job_id}.")
-                    break # Exit E2 loop
+    try: # Main try block for the thread function
+        while not g_shutdown_event.is_set():
+            need_new_job = False
+            clean_job_flag = False
 
-            e2_current = bytes(extranonce2) # Use immutable bytes for hashing
+            # --- Declare local job variables needed for hashing ---
+            version_local_le = 0
+            prevhash_local_bin_le = b''
+            coinb1_local_bin = b''
+            coinb2_local_bin = b''
+            extranonce1_local_bin = b''
+            merkle_branch_local_bin_be = []
+            ntime_local_le = 0
+            nbits_local_le = 0
+            job_id_for_new_work = None
 
-            # --- Calculate Merkle Root ---
-            try:
-                coinbase_tx = job["coinb1"] + e1 + e2_current + job["coinb2"]
-                coinbase_hash_be = sha256d(coinbase_tx); current_hash_be = coinbase_hash_be
-                for branch_be in job["merkle_branch"]:
-                    current_hash_be = sha256d(current_hash_be + branch_be)
-                merkle_root_le = reverse_bytes(current_hash_be)
-            except Exception as e:
-                logger.exception(f"Miner {thread_id} error calculating Merkle root for job {current_job_id}.")
-                job_abandoned_by_thread = True
-                continue # Skip to next E2 iteration (or job wait if loop breaks)
+            # --- Wait for a new job or shutdown ---
+            with g_job_lock:
+                # Wait until: shutdown OR connection lost OR (new job available AND its ID is different from ours)
+                while not (g_shutdown_event.is_set() or g_connection_lost_event.is_set() or \
+                           (g_new_job_available and g_job_id != current_job_id_local)):
+                    g_new_job_condition.wait(timeout=1.0) # Wait with timeout
 
-            # --- Construct Block Header Template (without nonce) ---
-            try:
-                version_bytes_le = job["version"].to_bytes(4, 'little')
-                prevhash_bytes_le = job["prevhash"] # Already LE bytes
-                ntime_bytes_le = job["ntime"].to_bytes(4, 'little')
-                # Use the stored nbits (already LE host int)
-                nbits_bytes_le = job["nbits"].to_bytes(4, 'little')
-                header_template_le = version_bytes_le + prevhash_bytes_le + merkle_root_le + ntime_bytes_le + nbits_bytes_le
-                if len(header_template_le) != 76:
-                     raise ValueError("Header template length != 76")
-            except Exception as e:
-                logger.exception(f"Miner {thread_id} error constructing header template for job {current_job_id}.")
-                job_abandoned_by_thread = True
-                continue # Skip to next E2 iteration
+                # --- Check conditions after waking up ---
+                if g_shutdown_event.is_set() or g_connection_lost_event.is_set():
+                    break # Exit the main while loop immediately
 
-            # --- Nonce Iteration Loop ---
-            nonce = 0; NONCE_MAX = 0xFFFFFFFF
-            while nonce <= NONCE_MAX:
-                # --- Periodic check for new job/shutdown/disconnect ---
-                if (nonce & 0xFFFF) == 0: # Check every 65536 nonces
-                    if g_sigint_shutdown.is_set() or g_connection_lost.is_set():
-                        job_abandoned_by_thread = True; break # Exit nonce loop
-                    with g_new_job_available: # Check job/target under lock
-                        if g_job_data["job_id"] != current_job_id: # New job arrived
-                            job_abandoned_by_thread = True; break # Exit nonce loop
-                        new_target = g_job_data["share_target"]
-                        if new_target != target: # Target updated
-                            target = new_target
-                        if target == 0: # Target became invalid?
-                            logger.warning(f"Miner {thread_id} target became 0 mid-job {current_job_id}. Abandoning.")
-                            job_abandoned_by_thread = True; break # Exit nonce loop
+                # Re-verify condition AFTER acquiring lock and waking up
+                if g_new_job_available and g_job_id != current_job_id_local:
+                    # Passed checks, it's a genuinely new job we should process
+                    job_id_for_new_work = g_job_id # Remember the job ID we decided to work on
+                    need_new_job = True
+                    clean_job_flag = g_clean_jobs
 
-                    # --- Report hash count periodically ---
-                    current_time = time.monotonic()
-                    if current_time - last_hash_report_time >= 1.0: # Report approx every second
-                        hashes_done = local_hashes
-                        local_hashes = 0 # Reset count *after* getting value
-                        if hashes_done > 0:
-                             with g_status_lock: # Acquire lock to update shared deque
-                                 g_hash_counts.append((current_time, hashes_done))
-                        last_hash_report_time = current_time # Update time after reporting
+                    # Copy necessary job details from global variables to local scope variables
+                    version_local_le = g_version_le
+                    prevhash_local_bin_le = g_prevhash_bin
+                    coinb1_local_bin = g_coinb1_bin
+                    coinb2_local_bin = g_coinb2_bin
+                    extranonce1_local_bin = g_extranonce1_bin
+                    merkle_branch_local_bin_be = list(g_merkle_branch_bin_be) # Copy list
+                    ntime_local_le = g_ntime_le
+                    nbits_local_le = g_nbits_le
+                    extranonce2_size_local = g_extranonce2_size
 
-                # --- Construct full header and hash ---
-                nonce_bytes_le = nonce.to_bytes(4, 'little')
-                header_le = header_template_le + nonce_bytes_le
-                block_hash_be = sha256d(header_le)
-                block_hash_le = reverse_bytes(block_hash_be)
-                local_hashes += 1 # Increment hash count *after* successful hash
+                    # Copy the current global share target atomically
+                    with g_share_target_lock:
+                        if g_share_target > 0:
+                            local_share_target = g_share_target
+                            share_target_loaded = True
+                        else:
+                            share_target_loaded = False
+                            log_msg(logging.WARNING, f"[WARN][MINER {thread_id}] Global share target is zero when trying to start job {g_job_id}. Waiting for target.")
+                            need_new_job = False # Prevent processing this job iteration
 
-                # --- Check hash against target ---
-                hash_int = int.from_bytes(block_hash_le, 'little')
-                if hash_int <= target:
-                    # Found a share!
-                    share_ntime_hex = job["ntime"].to_bytes(4,'big').hex()
-                    share_nonce_hex = nonce.to_bytes(4,'big').hex()
-                    share_e2_hex = bytes_to_hex(e2_current)
+                    # If target was loaded successfully, commit to this job
+                    if need_new_job:
+                        current_job_id_local = job_id_for_new_work # <<< IMPORTANT: Update local ID *inside the lock*
+                        g_new_job_available = False # This thread took the job signal (or one of them)
 
-                    # Calculate difficulties for logging
-                    net_diff = calculate_difficulty_from_nbits(job["nbits"]) # Use the nbits stored in the job
-                    share_diff = calculate_difficulty_from_target(target)
-                    network_target = calculate_target_from_difficulty(net_diff) if net_diff > 0 else (2**256-1)
-                    meets_network = hash_int <= network_target
-                    block_marker = " [BLOCK!]" if meets_network else ""
+                        # Initialize extranonce2 for the new job based on thread ID
+                        extranonce2_bin_local = bytearray(extranonce2_size_local)
+                        if extranonce2_size_local > 0 and num_threads > 0:
+                            # Distribute starting point based on thread_id
+                            # Use simple starting offset logic from C++
+                            start_val = thread_id # Simple offset start
+                            for i in range(min(extranonce2_size_local, 8)): # Max 8 bytes for 64-bit offset
+                                extranonce2_bin_local[i] = (start_val >> (i * 8)) & 0xFF
+                        # Job details logging will happen outside the lock
+                    # else: job stays None, need_new_job is False
 
-                    logger.info(f"SHARE FOUND! Job: {current_job_id} Nonce: 0x{nonce:08x} (Diff: {share_diff:.2f}){block_marker}")
-                    # logger.debug(f"Share Details: H(BE)={bytes_to_hex(block_hash_be)} Tgt={target:064x} E2(LE)={share_e2_hex}")
+                # --- End of Job Acquisition ---
 
-                    # --- Submit Share ---
-                    current_sock = None
-                    with g_sock_lock: current_sock = g_sock # Check socket under lock
-                    if current_sock:
-                        submit_id = int(time.time() * 1000) + thread_id # Simple unique-ish ID
-                        send_json_rpc(current_sock, "mining.submit", [
-                            g_config["wallet_address"], current_job_id,
-                            share_e2_hex, share_ntime_hex, share_nonce_hex
-                        ], submit_id)
+            # --- Process New Job Data (only if need_new_job is true) ---
+            if need_new_job:
+                # Log job start details
+                target_hex = f"{local_share_target:064x}" if share_target_loaded else "NotSet"
+                log_msg(logging.INFO, f"[MINER {thread_id}] Starting job {current_job_id_local} (Clean:{'Y' if clean_job_flag else 'N'} E2Size:{extranonce2_size_local} E2Start(LE):{bin_to_hex(extranonce2_bin_local)} NetNB:0x{nbits_local_le:08x} ShareTgt:{target_hex})")
+
+                # --- Hashing Loop (iterates through extranonce2 values for this job) ---
+                job_abandoned_by_thread = False
+                initial_e2_value = bytes(extranonce2_bin_local) # Remember start E2 for wrap check
+
+                while not job_abandoned_by_thread and not g_shutdown_event.is_set() and not g_connection_lost_event.is_set():
+
+                    # --- Periodically check for newer job / target update ---
+                    if random.randint(0, 10) == 0: # Check occasionally
+                         with g_job_lock:
+                             if g_job_id != current_job_id_local:
+                                 log_msg(logging.INFO, f"[MINER {thread_id}] New job {g_job_id} received while working on {current_job_id_local}. Abandoning old job.")
+                                 job_abandoned_by_thread = True
+                                 break # Exit E2 loop
+                             # Check target consistency
+                             with g_share_target_lock:
+                                 if g_share_target <= 0:
+                                      log_msg(logging.WARNING, f"[WARN][MINER {thread_id}] Global share target became zero mid-job {current_job_id_local}. Abandoning work.")
+                                      share_target_loaded = False
+                                      job_abandoned_by_thread = True
+                                      break # Exit E2 loop
+                                 elif share_target_loaded and g_share_target != local_share_target:
+                                      log_msg(logging.INFO, f"[MINER {thread_id}] Share target updated mid-job {current_job_id_local}. Applying.")
+                                      local_share_target = g_share_target
+                                      # Continue with new target
+
+                    if job_abandoned_by_thread: break
+
+                    # --- Calculate Merkle Root --- Use local variables ---
+                    try:
+                        # Pass the local copies of job data to the function
+                        current_merkle_root_le = calculate_simplified_merkle_root_le(
+                            coinb1_local_bin, extranonce1_local_bin, extranonce2_bin_local, # Use local versions
+                            coinb2_local_bin, merkle_branch_local_bin_be)                  # Use local versions
+                        if not current_merkle_root_le or len(current_merkle_root_le) != 32:
+                            log_msg(logging.ERROR, f"[MINER {thread_id}] Failed to calculate merkle root for job {current_job_id_local}. Abandoning.")
+                            job_abandoned_by_thread = True
+                            continue # To break outer loop
+                    except Exception as e:
+                        log_msg(logging.ERROR, f"[MINER {thread_id}] Exception calculating merkle root for job {current_job_id_local}: {e}. Abandoning.")
+                        job_abandoned_by_thread = True
+                        continue # To break outer loop
+
+
+                    # --- Construct Block Header Template (first 76 bytes) --- Use local variables ---
+                    try:
+                        header_template_le = struct.pack('<I', version_local_le) + \
+                                             prevhash_local_bin_le + \
+                                             current_merkle_root_le + \
+                                             struct.pack('<I', ntime_local_le) + \
+                                             struct.pack('<I', nbits_local_le)
+                        if len(header_template_le) != 76:
+                             log_msg(logging.ERROR, f"[MINER {thread_id}] Incorrect header template length ({len(header_template_le)}) for job {current_job_id_local}. Abandoning.")
+                             job_abandoned_by_thread = True
+                             continue
+                    except struct.error as e:
+                         log_msg(logging.ERROR, f"[MINER {thread_id}] Failed to pack header template for job {current_job_id_local}: {e}. Abandoning.")
+                         job_abandoned_by_thread = True
+                         continue
+                    except Exception as e:
+                         log_msg(logging.ERROR, f"[MINER {thread_id}] Unexpected error building header template for job {current_job_id_local}: {e}. Abandoning.")
+                         job_abandoned_by_thread = True
+                         continue
+
+                    # --- Nonce Loop ---
+                    # Python doesn't have SSE, so we just iterate nonces linearly within the thread's slice
+                    # Simple distribution: each thread handles nonces congruent to its ID mod num_threads
+                    nonce_limit = 0xFFFFFFFF # 2^32 - 1
+                    nonce_start = thread_id
+                    nonce_step = num_threads
+
+                    hash_counter_batch = 0 # Count hashes in this batch for reporting
+
+                    for nonce_le_int in range(nonce_start, nonce_limit + 1, nonce_step):
+                        # --- Periodic checks ---
+                        if (nonce_le_int & 0xFFFF) == (thread_id & 0xFFFF): # Check roughly every 65k nonces per thread
+                            if g_shutdown_event.is_set() or g_connection_lost_event.is_set():
+                                job_abandoned_by_thread = True
+                                break
+                            # Non-blocking check for new job/target
+                            with g_job_lock:
+                                if g_job_id != current_job_id_local:
+                                    job_abandoned_by_thread = True
+                                else:
+                                    with g_share_target_lock:
+                                        if g_share_target <= 0: job_abandoned_by_thread = True; share_target_loaded = False
+                                        elif share_target_loaded and g_share_target != local_share_target: local_share_target = g_share_target # Update target
+                            if job_abandoned_by_thread: break
+
+                            # Update hash count periodically
+                            if hash_counter_batch > 0:
+                                with g_thread_hash_counts_lock:
+                                    g_thread_hash_counts[thread_id] += hash_counter_batch
+                                hash_counter_batch = 0
+
+
+                        # --- Prepare 80-byte header with current nonce ---
+                        try:
+                            nonce_le_bytes = struct.pack('<I', nonce_le_int)
+                            header_le = header_template_le + nonce_le_bytes
+                        except struct.error:
+                            log_msg(logging.WARNING, f"[MINER {thread_id}] Failed to pack nonce {nonce_le_int}. Skipping.")
+                            continue
+
+                        # --- Double SHA256 ---
+                        final_hash_be = sha256_double_be(header_le)
+                        hash_counter_batch += 1
+
+                        # --- Check result against share target ---
+                        final_hash_le = final_hash_be[::-1] # Reverse for LE comparison
+                        if share_target_loaded and is_hash_less_or_equal_target(final_hash_le, local_share_target):
+                            # --- Share Found ---
+                            winning_nonce_le = nonce_le_int
+                            hash_hex_be = bin_to_hex(final_hash_be)
+                            share_timestamp = timestamp_us()
+
+                            # Check against network target (for logging '[BLOCK!]')
+                            # Note: This check in Python might be slightly different than the C++ bitwise check if edge cases exist
+                            network_difficulty = calculate_difficulty_nbits(nbits_local_le)
+                            share_difficulty = calculate_difficulty_from_target(int.from_bytes(final_hash_le, 'little'))
+                            meets_network_target = (network_difficulty > 0 and share_difficulty >= network_difficulty) # Approx check
+
+                            # Print to stdout/stderr
+                            print(f"\r{' '*80}\r", end='', file=sys.stderr) # Clear line
+                            print(f"{C_GREEN}[T{thread_id} {share_timestamp}] Share found! Job: {current_job_id_local} Nonce: 0x{winning_nonce_le:08x} {'[BLOCK!]' if meets_network_target else ''}{C_RESET}", flush=True)
+
+                            target_hex_log = f"{local_share_target:064x}"
+                            log_msg(logging.INFO, f"[SHARE FOUND][T{thread_id}] Job={current_job_id_local} N(LE)=0x{winning_nonce_le:08x} H(BE)={hash_hex_be} Tgt={target_hex_log} E2(LE)={bin_to_hex(extranonce2_bin_local)} {'[BLOCK!]' if meets_network_target else ''}")
+
+                            # --- Submit Share ---
+                            ntime_hex_be = uint32_to_hex_be(ntime_local_le)
+                            nonce_hex_be = uint32_to_hex_be(winning_nonce_le)
+                            extranonce2_hex = bin_to_hex(extranonce2_bin_local)
+                            submit_id = int(time.time() * 1000) + thread_id # Reasonably unique ID
+
+                            payload = {
+                                "id": submit_id,
+                                "method": "mining.submit",
+                                "params": [
+                                    g_wallet_addr,
+                                    current_job_id_local,
+                                    extranonce2_hex,
+                                    ntime_hex_be,
+                                    nonce_hex_be
+                                ]
+                            }
+                            # Send submission
+                            with g_socket_lock:
+                                current_socket = g_socket
+                            if current_socket:
+                                if send_json_message(current_socket, payload):
+                                    log_msg(logging.INFO, f"[SUBMIT][T{thread_id}] Submitted share ID {submit_id} for job {current_job_id_local}")
+                                else:
+                                    log_msg(logging.ERROR, f"[SUBMIT][T{thread_id}] Failed to send share ID {submit_id} for job {current_job_id_local} (connection issue?)")
+                                    # Connection lost event should be set by send_json_message on failure
+                            else:
+                                 log_msg(logging.ERROR, f"[SUBMIT][T{thread_id}] Cannot submit share ID {submit_id} - No active socket.")
+                                 g_connection_lost_event.set() # Assume connection is lost
+
+                            job_abandoned_by_thread = True # Found share, stop working on this extranonce2
+                            break # Exit the nonce loop
+
+                    # --- End of Nonce Loop ---
+
+                    # Update remaining hashes from the loop
+                    if hash_counter_batch > 0:
+                        with g_thread_hash_counts_lock:
+                           g_thread_hash_counts[thread_id] += hash_counter_batch
+                        hash_counter_batch = 0
+
+                    # If job was abandoned (share found, new job, shutdown, error), break extranonce2 loop
+                    if job_abandoned_by_thread:
+                        break
+
+                    # --- Increment Extranonce2 (Little Endian) ---
+                    if not increment_extranonce2(extranonce2_bin_local):
+                        # Full wrap-around occurred
+                        log_msg(logging.WARNING, f"[WARN][T{thread_id}] Extranonce2 space fully wrapped for job {current_job_id_local}. E2(LE): {bin_to_hex(extranonce2_bin_local)}. Waiting for new job.")
+                        job_abandoned_by_thread = True # Mark job as done for this thread
+                        break # Exit E2 loop
                     else:
-                        # Socket is closed, cannot submit
-                        logger.error("Cannot submit share, socket is closed.")
-                        g_connection_lost.set() # Ensure connection state is updated
-                        with g_new_job_available: # Notify other threads waiting
-                            g_new_job_available.notify_all()
+                        # Simple check if E2 returned to its starting value for this thread
+                        # This isn't perfectly robust for exhaustion detection across threads,
+                        # but matches the C++ 'wrap' check logic more closely.
+                        if bytes(extranonce2_bin_local) == initial_e2_value and extranonce2_size_local > 0:
+                           log_msg(logging.WARNING, f"[WARN][T{thread_id}] Extranonce2 space potentially exhausted (returned to start value) for job {current_job_id_local}. Waiting for new job.")
+                           job_abandoned_by_thread = True # Treat as exhausted for this thread
+                           break # Exit E2 loop
+                    # If not wrapped, loop continues with next extranonce2 value
 
-                    # Stop working on this E2 value after finding a share
-                    job_abandoned_by_thread = True
-                    break # Exit nonce loop
+                # --- End of Extranonce2 Loop ---
+            # --- End of if (need_new_job) ---
+            else:
+                # If we woke up but didn't process a job (spurious, target not ready, race condition)
+                # Add a small sleep to prevent potential busy-waiting.
+                if not g_shutdown_event.is_set() and not g_connection_lost_event.is_set():
+                     time.sleep(0.02) # 20ms sleep
 
-                nonce += 1
-            # --- End Nonce Loop ---
+        # --- End of Main Mining Loop (while not g_shutdown_event.is_set()) ---
 
-            # --- After nonce loop (natural end or break): Check flags and report remaining hashes ---
-            if job_abandoned_by_thread or g_sigint_shutdown.is_set() or g_connection_lost.is_set():
-                 # If loop was broken by abandon/shutdown/disconnect, exit E2 loop too
-                 break
+    except Exception as e:
+        log_msg(logging.ERROR, f"[FATAL][MINER {thread_id}] Terminating due to exception: {e}")
+        import traceback
+        log_msg(logging.ERROR, traceback.format_exc())
+        g_connection_lost_event.set() # Signal loss
+        with g_job_lock:
+            g_new_job_condition.notify_all() # Wake others
 
-            # *** CORRECTED BLOCK START ***
-            # Report any remaining hashes accumulated during the last part of the nonce loop for this E2
-            if local_hashes > 0:
-                with g_status_lock: # Acquire lock to update shared deque
-                     g_hash_counts.append((time.monotonic(), local_hashes))
-                local_hashes = 0 # Reset count *after* reporting
-            # *** CORRECTED BLOCK END ***
+    # --- Cleanup Actions before thread exits ---
+    if not g_shutdown_event.is_set() and not g_connection_lost_event.is_set():
+        log_msg(logging.WARNING, f"[MINER {thread_id}] Exiting unexpectedly, signaling connection lost.")
+        g_connection_lost_event.set()
+        with g_job_lock:
+            g_new_job_condition.notify_all()
 
-            e2_iterations += 1 # Move to next E2 value
-        # --- End Extranonce2 Loop ---
+    log_msg(logging.INFO, f"[MINER {thread_id}] Thread finished.")
+# --- End of miner_func ---
 
-        # Loop will naturally restart to wait for a new job if E2 loop finished
-        # If loop was broken by flags, the outer `while not g_sigint_shutdown.is_set():` check will handle exit
 
-    # --- Miner Thread Exit ---
-    logger.info(f"Miner thread {thread_id} finished.")
-    # Final hash report before exiting
-    # *** CORRECTED BLOCK START ***
-    if local_hashes > 0:
-        with g_status_lock: # Acquire lock to update shared deque
-            g_hash_counts.append((time.monotonic(), local_hashes))
-    # *** CORRECTED BLOCK END ***
-# --- Status Thread ---
-def status_thread_func():
-    """Periodically logs status."""
-    thread_name = threading.current_thread().name
-    logger.info("Status thread started.")
-    global g_last_status_time # No need for g_total_hashes_reported here
+# --- Subscribe Thread ---
+def subscribe_func():
+    """Handles Stratum protocol communication (subscribe, authorize, jobs, difficulty)."""
+    global g_socket # Access global socket reference
+    thread_name = "Subscribe"
+    threading.current_thread().name = thread_name
+    log_msg(logging.INFO, "[SUB] Subscribe thread started.")
 
-    while not g_sigint_shutdown.is_set():
-        now = time.monotonic()
-        if now - g_last_status_time >= STATUS_LOG_INTERVAL_SECONDS:
-            rate = 0.0; duration = 0; total_hashes_in_window = 0
+    buffer_agg = "" # Aggregated data buffer
 
-            with g_status_lock:
-                window_duration = 60.0; window_start_time = now - window_duration
-                valid_entries = [(t, h) for t, h in g_hash_counts if t >= window_start_time]
-                if valid_entries:
-                    first_ts = valid_entries[0][0]; last_ts = valid_entries[-1][0]
-                    total_hashes_in_window = sum(h for _, h in valid_entries)
-                    if len(valid_entries) > 1: duration = last_ts - first_ts
-                    elif len(valid_entries) == 1: duration = max(now - first_ts, 1.0)
-                    if duration > 0: rate = total_hashes_in_window / duration
-                    while len(g_hash_counts) > 0 and g_hash_counts[0][0] < window_start_time: g_hash_counts.popleft()
+    time.sleep(0.2) # Wait a bit for main thread to potentially connect
 
-            display_rate = rate; unit = "H/s"
-            if rate >= 1e9: display_rate = rate / 1e9; unit = "GH/s"
-            elif rate >= 1e6: display_rate = rate / 1e6; unit = "MH/s"
-            elif rate >= 1e3: display_rate = rate / 1e3; unit = "kH/s"
+    while not g_shutdown_event.is_set():
+        sock_to_use = None
+        with g_socket_lock:
+            if g_socket:
+               sock_to_use = g_socket
+            else:
+               # Socket not ready or already closed by main thread
+               time.sleep(1)
+               continue
 
-            local_height = g_current_height # Read directly
-            local_job_id = None; local_nbits = 0; local_share_target = 0
-            local_accepted = 0; local_rejected = 0
+        log_msg(logging.INFO, f"[SUB] Socket FD {sock_to_use.fileno() if sock_to_use else 'N/A'} valid. Sending subscribe/authorize.")
 
-            with g_new_job_available: # Lock for job data
-                 local_job_id = g_job_data["job_id"]
-                 local_nbits = g_job_data["nbits"] # This is LE host int
-                 local_share_target = g_job_data["share_target"]
-            with g_status_lock: # Lock for share counts
-                 local_accepted = g_shares_accepted
-                 local_rejected = g_shares_rejected
+        # Send subscribe
+        subscribed = send_json_message(sock_to_use, {"id": 1, "method": "mining.subscribe", "params": ["SimplePythonMiner/1.0"]})
+        if not subscribed:
+            log_msg(logging.ERROR, "[SUB] Send subscribe failed. Waiting for reconnect.")
+            # Rely on main loop to handle reconnect based on g_connection_lost_event
+            time.sleep(RECONNECT_DELAY_SECONDS)
+            continue
 
-            net_diff = calculate_difficulty_from_nbits(local_nbits) if local_nbits else 0.0
-            share_diff = calculate_difficulty_from_target(local_share_target) if local_share_target else 0.0
-            height_display = f"~{local_height}" if local_height > 0 else "N/A" # Use N/A initially
+        # Send authorize
+        authed = send_json_message(sock_to_use, {"id": 2, "method": "mining.authorize", "params": [g_wallet_addr, g_pool_password]})
+        if not authed:
+            log_msg(logging.ERROR, "[SUB] Send authorize failed. Waiting for reconnect.")
+             # Rely on main loop
+            time.sleep(RECONNECT_DELAY_SECONDS)
+            continue
 
-            status_str = (f"H: {height_display} | NetD: {net_diff:.3e} | ShareD: {share_diff:.1f} | "
-                          f"Rate: {display_rate:.2f} {unit} | A/R: {local_accepted}/{local_rejected}")
+        buffer_agg = "" # Clear any previous buffer data
+        log_msg(logging.INFO, f"[SUB] Waiting for pool messages on FD {sock_to_use.fileno()}...")
 
-            # *** Log the status - this now handles console output too ***
-            logger.info(f"[STATUS] {status_str}")
-            # *** Removed the direct print() call ***
+        # Inner loop: Process messages while connected and using this socket
+        try:
+            while not g_shutdown_event.is_set():
+                 # Check if the global socket has changed or been closed
+                 with g_socket_lock:
+                     if g_socket != sock_to_use:
+                         log_msg(logging.INFO, f"[SUB] Socket FD {sock_to_use.fileno()} closed externally or changed. Exiting receive loop.")
+                         break # Exit inner loop, main loop will handle state
 
-            g_last_status_time = now
+                 # Use select for non-blocking read check with timeout
+                 ready_to_read, _, _ = select.select([sock_to_use], [], [], 2.0) # 2 second timeout
 
-        shutdown_detected = g_sigint_shutdown.wait(timeout=1.0)
-        if shutdown_detected: break
+                 if not ready_to_read:
+                      # Timeout, check shutdown/socket change again
+                      continue
 
-    logger.info("Status thread finished.")
+                 # Data available, try to read
+                 chunk = sock_to_use.recv(8192)
+                 if not chunk:
+                     # Connection closed gracefully by pool
+                     log_msg(logging.INFO, f"[SUB] Pool disconnected FD {sock_to_use.fileno()} (read 0 bytes).")
+                     raise socket.error("Pool closed connection") # Trigger reconnect
 
-# --- Main Execution ---
+                 # Process received data
+                 buffer_agg += chunk.decode('utf-8', errors='replace') # Decode assuming UTF-8
+
+                 # Process line by line from aggregated buffer
+                 while '\n' in buffer_agg:
+                     line, buffer_agg = buffer_agg.split('\n', 1)
+                     line = line.strip()
+                     if not line: continue # Skip empty lines
+
+                     # Parse JSON
+                     try:
+                         message = json.loads(line)
+                         # log_msg(logging.DEBUG, f"[DEBUG][SUB] Recv: {line}")
+                     except json.JSONDecodeError:
+                         log_msg(logging.ERROR, f"[ERROR][SUB] JSON parse error for line: {line[:200]}")
+                         continue # Skip this line, try next
+
+                     # Process the parsed message
+                     process_pool_message(message, line) # Pass original line for logging errors
+
+                 # Check after processing potential messages if we should exit
+                 if g_shutdown_event.is_set() or g_connection_lost_event.is_set():
+                      break # Exit inner loop
+
+            # --- End inner message processing loop ---
+
+        except socket.timeout:
+            # This shouldn't happen with select, but handle defensively
+             log_msg(logging.WARNING, "[SUB] Socket timeout during recv (unexpected).")
+             continue # Continue outer loop to check socket state
+        except socket.error as e:
+            # Handle socket errors (connection reset, broken pipe, etc.)
+            log_msg(logging.ERROR, f"[ERR][SUB] Socket error on FD {sock_to_use.fileno()}: {e}")
+            g_connection_lost_event.set() # Signal connection lost
+            with g_job_lock:
+                 g_new_job_condition.notify_all() # Wake threads
+            # Break inner loop automatically due to exception
+        except Exception as e:
+            log_msg(logging.ERROR, f"[FATAL][SUB] Unexpected error in receive loop: {e}")
+            import traceback
+            log_msg(logging.ERROR, traceback.format_exc())
+            g_connection_lost_event.set()
+            with g_job_lock:
+                g_new_job_condition.notify_all()
+            # Break inner loop
+
+        # --- After exiting inner loop ---
+        if g_shutdown_event.is_set():
+            log_msg(logging.INFO, "[SUB] Shutdown signal received, exiting.")
+            break # Exit outer loop
+
+        log_msg(logging.INFO, f"[SUB] Exited receive loop for FD {sock_to_use.fileno()}. Assuming connection lost or socket changed.")
+        if not g_connection_lost_event.is_set():
+            # If the event wasn't set by an error, set it now to trigger reconnect
+            g_connection_lost_event.set()
+            with g_job_lock:
+                g_new_job_condition.notify_all()
+
+        time.sleep(0.5) # Small delay before potentially retrying outer loop
+
+    # --- End main subscribe loop ---
+    log_msg(logging.INFO, "[SUB] Subscribe thread finished.")
+
+# --- Process Pool Messages ---
+def process_pool_message(message, original_line=""):
+    """Parses and handles messages received from the pool."""
+    global g_extranonce1_bin, g_extranonce2_size, g_job_id, g_prevhash_bin
+    global g_coinb1_bin, g_coinb2_bin, g_merkle_branch_bin_be, g_version_le
+    global g_nbits_le, g_ntime_le, g_clean_jobs, g_new_job_available, g_share_target
+    global g_current_height
+
+    msg_id = message.get('id')
+    method = message.get('method')
+    params = message.get('params')
+    result = message.get('result')
+    error = message.get('error')
+
+    try: # Wrap processing in a try block
+        if msg_id is not None: # It's a Response
+            if error: # Error Response
+                err_str = json.dumps(error)
+                log_msg(logging.ERROR, f"[ERR][SUB] Pool error response ID {msg_id}: {err_str}")
+                print(f"\r{' '*80}\r{C_RED}[{timestamp_us()}] Pool Error (ID {msg_id}): {err_str}{C_RESET}", file=sys.stderr, flush=True)
+
+                if msg_id == 1: # Subscribe failed
+                    raise RuntimeError("Subscribe failed via pool error response")
+                elif msg_id == 2: # Authorize failed
+                    print(f"\r{' '*80}\r{C_RED}[{timestamp_us()}] AUTH FAILED: {err_str}{C_RESET}", file=sys.stderr, flush=True)
+                    raise RuntimeError("Authorization failed via pool error response")
+                elif isinstance(msg_id, int) and msg_id >= 100: # Share submission rejected
+                    print(f"\r{' '*80}\r{C_RED}[{timestamp_us()}] Share REJECTED (ID {msg_id}): {err_str}{C_RESET}", file=sys.stderr, flush=True)
+                    # Continue mining
+                # else: Other error response, just log
+
+            elif result is not None or method is None: # Success Response (result can be True, False, null, or data)
+                if msg_id == 1: # Subscribe Response
+                    # Expected format: result = [ ["mining.notify", subscription_id], extranonce1_hex, extranonce2_size ]
+                    # Sometimes the inner list is omitted: result = [ subscription_details, extranonce1_hex, extranonce2_size ]
+                    if isinstance(result, list) and len(result) >= 2:
+                        try:
+                           e1h_idx, e2s_idx = -1, -1
+                           # Find hex string (extranonce1) and integer (extranonce2_size)
+                           for i, item in enumerate(result):
+                               if isinstance(item, str) and len(item) % 2 == 0: # Potential hex
+                                   try: binascii.unhexlify(item); e1h_idx = i; break # Found valid hex
+                                   except: pass
+                           for i, item in enumerate(result):
+                               if isinstance(item, int): e2s_idx = i; break # Found integer
+
+                           if e1h_idx != -1 and e2s_idx != -1:
+                               e1h = result[e1h_idx]
+                               e2s_i = result[e2s_idx]
+                               e1b = hex_to_bin(e1h)
+                               if e1b is not None:
+                                   with g_job_lock:
+                                       g_extranonce1_bin = e1b
+                                       g_extranonce2_size = int(e2s_i)
+                                       log_msg(logging.INFO, f"[SUB] Subscribe OK. E1: {e1h} ({len(g_extranonce1_bin)}B), E2Size: {g_extranonce2_size}")
+                                       print(f"[POOL] Subscribe OK. Extranonce2 Size: {g_extranonce2_size}", flush=True)
+                               else:
+                                    log_msg(logging.ERROR, f"[ERR][SUB] Failed to convert extranonce1 hex '{e1h}'")
+                                    raise RuntimeError("Failed to parse extranonce1 from subscribe response")
+                           else:
+                               log_msg(logging.ERROR, f"[ERR][SUB] Could not find extranonce1(hex) and extranonce2_size(int) in subscribe result: {result}")
+                               raise RuntimeError("Invalid subscribe response format (missing e1/e2s)")
+                        except Exception as e:
+                            log_msg(logging.ERROR, f"[ERR][SUB] Error processing subscribe result: {e} - Result: {result}")
+                            raise RuntimeError(f"Error processing subscribe response: {e}")
+                    else:
+                        log_msg(logging.ERROR, f"[ERR][SUB] Invalid subscribe response format (structure): {result}")
+                        raise RuntimeError("Invalid subscribe response format (structure)")
+
+                elif msg_id == 2: # Authorize Response
+                    auth_ok = bool(result) # True if result is truthy (True, non-empty list/dict, etc.), False if False/None/0
+                    log_msg(logging.INFO, f"[SUB] Authorization {'successful' if auth_ok else 'failed'}.")
+                    if auth_ok:
+                        print(f"{C_GREEN}[POOL] Authorization OK.{C_RESET}", flush=True)
+                    else:
+                         err_str = json.dumps(result) # Show the actual result if !auth_ok
+                         print(f"\r{' '*80}\r{C_RED}[{timestamp_us()}] AUTHORIZATION FAILED! Result: {err_str}. Check wallet/password.{C_RESET}", file=sys.stderr, flush=True)
+                         raise RuntimeError("Authorization failed")
+
+                elif isinstance(msg_id, int) and msg_id >= 100: # Share Submit Response
+                    share_accepted = bool(result) # True if result is True, False otherwise (null maps to False)
+                    if share_accepted:
+                        log_msg(logging.INFO, f"[SUB] Share (ID {msg_id}) accepted by pool.")
+                        print(f"{C_GREEN}[{timestamp_us()}] Share Accepted! (ID {msg_id}){C_RESET}", flush=True)
+                    else:
+                        res_str = json.dumps(result)
+                        log_msg(logging.WARNING, f"[WARN][SUB] Share (ID {msg_id}) rejected by pool. Result: {res_str}")
+                        print(f"\r{' '*80}\r{C_YELLOW}[{timestamp_us()}] Share Rejected? (ID {msg_id}) Result: {res_str}{C_RESET}", file=sys.stderr, flush=True)
+                else:
+                    log_msg(logging.WARNING, f"[WARN][SUB] Received success result for unexpected ID: {msg_id}, Result: {json.dumps(result)}")
+            # else: No error and no result? Log maybe.
+            #     log_msg(logging.WARNING, f"[WARN][SUB] Response received for ID {msg_id} with no 'result' and no 'error' field.")
+
+        elif method: # It's a Notification
+            if method == "mining.notify":
+                # --- Handle mining.notify ---
+                if isinstance(params, list) and len(params) >= 9:
+                    try:
+                        job_id_str, ph_h, cb1_h, cb2_h, mb_hex_list, v_h, nb_h, nt_h, clean_j = params[:9]
+
+                        # --- Acquire lock and update job details ---
+                        with g_job_lock:
+                            # Convert and validate hex data
+                            tph_be = hex_to_bin(ph_h)
+                            tcb1 = hex_to_bin(cb1_h)
+                            tcb2 = hex_to_bin(cb2_h)
+                            tmbl_be = [hex_to_bin(h) for h in mb_hex_list]
+
+                            # Check conversions
+                            if tph_be is None or len(tph_be) != 32: raise ValueError(f"Bad prevhash hex '{ph_h}'")
+                            if tcb1 is None: raise ValueError(f"Bad coinb1 hex '{cb1_h}'")
+                            if tcb2 is None: raise ValueError(f"Bad coinb2 hex '{cb2_h}'")
+                            if not all(b is not None and len(b) == 32 for b in tmbl_be): raise ValueError(f"Bad merkle branch hex list")
+
+                            # Convert V, NB, NT from hex BE to integer LE
+                            t_v = int.from_bytes(hex_to_bin(v_h), 'big')
+                            t_nb = int.from_bytes(hex_to_bin(nb_h), 'big')
+                            t_nt = int.from_bytes(hex_to_bin(nt_h), 'big')
+
+                            # Commit changes to global state
+                            g_job_id = job_id_str
+                            g_prevhash_bin = tph_be[::-1] # Reverse BE hash to store LE prevhash
+                            g_coinb1_bin = tcb1
+                            g_coinb2_bin = tcb2
+                            g_merkle_branch_bin_be = tmbl_be # Store BE list
+                            g_version_le = t_v # Already in host integer format
+                            g_nbits_le = t_nb # Already in host integer format
+                            g_ntime_le = t_nt # Already in host integer format
+                            g_clean_jobs = bool(clean_j)
+                            g_new_job_available = True
+
+                            # --- Log Job Info & Notify Miners ---
+                            new_block = (ph_h != getattr(process_pool_message, "last_ph_hex", "")) # Track block changes
+                            process_pool_message.last_ph_hex = ph_h # Store for next comparison
+
+                            if new_block:
+                                with g_current_height_lock:
+                                    if g_current_height > 0: g_current_height += 1
+                                    ch = g_current_height # Local copy for logging
+                                net_diff = calculate_difficulty_nbits(g_nbits_le)
+                                log_msg(logging.INFO, f"[JOB] New Block ~{ch if ch > 0 else 0}. Job: {job_id_str} (Clean:{'Y' if g_clean_jobs else 'N'} Diff:{net_diff:.3f} nBits:0x{g_nbits_le:08x})")
+                                print(f"\r{' '*80}\r{C_YELLOW}[*] New Block ~{ch if ch>0 else 0} | NetDiff: {net_diff:.3e} | Job: {job_id_str}{C_RESET}", flush=True)
+                            else:
+                                log_msg(logging.INFO, f"[JOB] New Job: {job_id_str} (Clean:{'Y' if g_clean_jobs else 'N'})")
+
+                            # Notify waiting miner threads
+                            g_new_job_condition.notify_all()
+                        # --- End Job Lock ---
+
+                    except (ValueError, TypeError, IndexError, struct.error) as e:
+                         log_msg(logging.ERROR, f"[ERR][SUB] mining.notify message has incorrect parameter types/values: {e}. Line: {original_line[:200]}")
+                    except Exception as e:
+                         log_msg(logging.ERROR, f"[ERR][SUB] Unexpected error processing mining.notify: {e}. Line: {original_line[:200]}")
+                else:
+                     log_msg(logging.ERROR, f"[ERR][SUB] Bad notify params structure. Line: {original_line[:200]}")
+
+            elif method == "mining.set_difficulty":
+                # --- Handle mining.set_difficulty ---
+                if isinstance(params, list) and len(params) > 0:
+                    pool_difficulty = params[0]
+                    if isinstance(pool_difficulty, (int, float)) and pool_difficulty > 0:
+                        log_msg(logging.INFO, f"[SUB] Received pool difficulty: {pool_difficulty:.5f}")
+                        print(f"[POOL] Difficulty set to: {pool_difficulty:.5f}", flush=True)
+
+                        # --- Calculate Share Target from Pool Difficulty ---
+                        # Target = Target1 / Difficulty
+                        try:
+                            # Use float for calculation robustness
+                            new_target_f = float(TARGET1) / float(pool_difficulty)
+                            # Convert to integer, clamping ensures it's within 256 bits and positive
+                            new_target_int = max(1, min(int(new_target_f), MAX_TARGET_256))
+
+                            with g_share_target_lock:
+                                g_share_target = new_target_int
+
+                            actual_share_diff = calculate_difficulty_from_target(g_share_target)
+                            target_hex_log = f"{g_share_target:064x}"
+                            log_msg(logging.INFO, f"[SUB] Updated Share Target to {target_hex_log}. PoolDiff: {pool_difficulty:.5f} -> Actual ShareDiff: {actual_share_diff:.5f}")
+
+                        except (ZeroDivisionError, OverflowError, ValueError) as e:
+                             log_msg(logging.ERROR, f"[ERR][SUB] Error calculating share target from difficulty {pool_difficulty}: {e}")
+                        except Exception as e:
+                             log_msg(logging.ERROR, f"[ERR][SUB] Unexpected error calculating share target: {e}")
+
+                    else:
+                        log_msg(logging.WARNING, f"[WARN][SUB] Difficulty has invalid type/value ({type(pool_difficulty)}): {pool_difficulty}. Ignoring.")
+                        print(f"[POOL] Difficulty has type {type(pool_difficulty)}: {pool_difficulty} (Ignored)", flush=True)
+                else:
+                     log_msg(logging.WARNING, f"[WARN][SUB] Bad set_difficulty params structure (not list or empty). Params: {params}")
+            else:
+                log_msg(logging.WARNING, f"[WARN][SUB] Received unknown notification method: {method}, Params: {params}")
+        else:
+             log_msg(logging.WARNING, f"[WARN][SUB] Received message with no ID and no method: {original_line[:200]}")
+
+    except RuntimeError as e: # Catch critical errors like auth/sub failure
+        log_msg(logging.ERROR, f"[FATAL][SUB] Runtime error processing message: {e}. Signaling loss.")
+        g_connection_lost_event.set()
+        with g_job_lock: g_new_job_condition.notify_all()
+        raise # Re-raise to potentially stop the subscribe thread immediately
+    except Exception as e:
+        log_msg(logging.ERROR, f"[ERROR][SUB] Exception processing message: {e}. Line: {original_line[:200]}")
+        import traceback
+        log_msg(logging.ERROR, traceback.format_exc())
+        # Decide if this error is fatal or recoverable
+
+# --- Periodic Status Logger ---
+def log_periodic_status():
+    global g_total_hashes_reported, g_aggregated_hash_rate, g_last_aggregated_report_time
+
+    now = time.monotonic()
+    duration = now - g_last_aggregated_report_time
+
+    if duration < 0.1: return # Minimum 100ms interval
+
+    # Get current total hashes from threads
+    current_total_hashes = 0
+    with g_thread_hash_counts_lock:
+        current_total_hashes = sum(g_thread_hash_counts)
+
+    delta_hashes = current_total_hashes - g_total_hashes_reported
+    if delta_hashes < 0: delta_hashes = 0 # Handle counter reset or race condition
+
+    # Calculate rate in H/s
+    current_rate = (delta_hashes / duration) if duration > 0 else 0.0
+
+    # Update global state
+    g_aggregated_hash_rate = current_rate
+    g_total_hashes_reported = current_total_hashes # Update total count reported
+    g_last_aggregated_report_time = now
+
+    # Get other status info
+    with g_current_height_lock: height_local = g_current_height
+    with g_job_lock: nbits_net_local_le = g_nbits_le # Read under lock
+    with g_share_target_lock: current_share_target_copy = g_share_target
+
+    difficulty_share_local = calculate_difficulty_from_target(current_share_target_copy) if current_share_target_copy > 0 else 0.0
+    difficulty_net_local = calculate_difficulty_nbits(nbits_net_local_le)
+
+    # Format hashrate for display
+    display_rate = current_rate
+    rate_unit = "H/s"
+    if display_rate >= 1e12: display_rate /= 1e12; rate_unit = "TH/s"
+    elif display_rate >= 1e9: display_rate /= 1e9; rate_unit = "GH/s"
+    elif display_rate >= 1e6: display_rate /= 1e6; rate_unit = "MH/s"
+    elif display_rate >= 1e3: display_rate /= 1e3; rate_unit = "kH/s"
+
+    # Log to file
+    log_msg(logging.INFO, f"[STATUS] Height: ~{height_local if height_local>0 else 0} | NetDiff: {difficulty_net_local:.3f} | ShareDiff: {difficulty_share_local:.3f} | Rate: {display_rate:.2f} {rate_unit}")
+
+    # Print status to stderr (overwriting previous line)
+    status_line = f"[{timestamp_us()}] [STATUS] H: ~{height_local if height_local>0 else 0} | NetD: {difficulty_net_local:.3e} | ShareD: {difficulty_share_local:.3f} | Rate: {display_rate:.2f} {rate_unit}"
+    print(f"\r{' '*80}\r{C_CYAN}{status_line}{C_RESET}", end='', file=sys.stderr)
+    sys.stderr.flush()
+
+
+# --- Main Function ---
 def main():
-    global g_sock, g_current_height
-    logger.info("Miner v0.1.2")
-    #print("Miner v0.1.2 ") # Version bump
+    global g_socket, g_thread_hash_counts
+    global g_total_hashes_reported, g_aggregated_hash_rate, g_last_aggregated_report_time
+    global g_job_id, g_prevhash_bin, g_coinb1_bin, g_coinb2_bin, g_merkle_branch_bin_be
+    global g_version_le, g_nbits_le, g_ntime_le, g_clean_jobs, g_new_job_available
+    global g_extranonce1_bin, g_extranonce2_size, g_share_target, g_current_height
 
+    # --- Signal Handling ---
     signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
+    if hasattr(signal, 'SIGPIPE'):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN) # Ignore SIGPIPE on POSIX
 
+    # --- Load Configuration ---
+    print(f"Loading configuration from {CONFIG_FILE}...")
     if not load_config():
-        print("Exiting due to configuration errors.", file=sys.stderr)
         sys.exit(1)
 
-    logger.info("--------------------------------------------------")
-    logger.info("Miner starting with configuration:")
-    for key, value in g_config.items():
-         log_value = "(set)" if key == "pool_password" and value else value
-         logger.info(f"  {key.replace('_', ' ').title()}: {log_value}")
-    logger.info("--------------------------------------------------")
-    logger.info(f"Console log level: {logging.getLevelName(console_handler.level)}")
-    if file_handler: logger.info(f"File log level: {logging.getLevelName(file_handler.level)}")
+    # --- Setup File Logger (now that g_log_file is known) ---
+    setup_file_logger()
 
-    threads = []
-    while not g_sigint_shutdown.is_set():
-        logger.info(f"Attempting connection to pool {g_config['pool_host']}:{g_config['pool_port']}...")
-        g_connection_lost.clear()
-        with g_status_lock: g_hash_counts.clear(); g_shares_accepted = 0; g_shares_rejected = 0
-        with g_new_job_available:
-             g_job_data["job_id"] = None; g_job_data["share_target"] = calculate_target_from_difficulty(1.0)
-             g_job_data["extranonce1"] = None; g_current_height = -1 # Reset height on reconnect
+    # --- Start Logging ---
+    log_msg(logging.INFO,"--------------------------------------------------")
+    log_msg(logging.INFO,"Miner starting with configuration:")
+    log_msg(logging.INFO,f"  Pool: {g_pool_host}:{g_pool_port}")
+    log_msg(logging.INFO,f"  Wallet/Worker: {g_wallet_addr}")
+    log_msg(logging.INFO,f"  Password: {'[empty]' if not g_pool_password else '(set)'}") # Don't log password
+    log_msg(logging.INFO,f"  Log File: {g_log_file}")
+    log_msg(logging.INFO,f"  Threads: {g_threads}")
+    log_msg(logging.INFO,"--------------------------------------------------")
 
-        new_sock = connect_pool()
+    # --- Check CPU Features (Omitted - Python doesn't use SSE) ---
+    # print("Checking CPU features...")
+    # print("[INFO] CPU Features: SSE check skipped for Python version.")
 
-        if new_sock:
-            with g_sock_lock: g_sock = new_sock
-            logger.info(f"Connection successful (FD {g_sock.fileno()}). Starting threads...")
+    # --- Display Basic Info ---
+    print(f"{C_MAG}----------------------------------------{C_RESET}")
+    print(f"{C_MAG} Wallet: {C_YELLOW}{g_wallet_addr}{C_RESET}")
+    print(f"{C_MAG} Threads: {C_YELLOW}{g_threads}{C_RESET}")
+    print(f"{C_MAG} Pool: {C_YELLOW}{g_pool_host}:{g_pool_port}{C_RESET}")
+    print(f"{C_MAG}----------------------------------------{C_RESET}")
+    sys.stdout.flush()
 
-            threads = []
-            sub_thread = threading.Thread(target=subscribe_thread_func, name="SubscribeThread", daemon=True)
-            sub_thread.start(); threads.append(sub_thread)
-            time.sleep(0.1) # Small delay potentially helps stabilize thread start
+    # --- Initialize Hashrate Counters ---
+    with g_thread_hash_counts_lock:
+        g_thread_hash_counts = [0] * g_threads # Initialize list with zeros
+    g_total_hashes_reported = 0
+    g_aggregated_hash_rate = 0.0
+    g_last_aggregated_report_time = time.monotonic()
 
-            status_thread = threading.Thread(target=status_thread_func, name="StatusThread", daemon=True)
-            status_thread.start(); threads.append(status_thread)
-            time.sleep(0.1)
 
-            num_miner_threads = g_config['threads']
-            for i in range(num_miner_threads):
-                miner_thread = threading.Thread(target=miner_thread_func, args=(i, num_miner_threads), name=f"MinerThread-{i}", daemon=True)
-                miner_thread.start(); threads.append(miner_thread)
+    # --- Get Initial Block Height ---
+    log_msg(logging.INFO,"[MAIN] Fetching initial block height...")
+    print("[INFO] Fetching initial block height from API...")
+    sys.stdout.flush()
+    initial_height = get_current_block_height()
+    with g_current_height_lock:
+        g_current_height = initial_height # Store initial height (-1 if failed)
+    if initial_height > 0:
+        print(f"{C_CYAN}[INFO] Initial block height estimated at: {initial_height}{C_RESET}")
+        log_msg(logging.INFO, f"[MAIN] Initial block height from API: {initial_height}")
+    else:
+        print(f"{C_YELLOW}[WARN] Could not fetch initial block height from API.{C_RESET}")
+        log_msg(logging.WARNING, "[WARN] Failed to fetch initial block height from API.")
+    sys.stdout.flush()
 
-            while not g_sigint_shutdown.is_set() and not g_connection_lost.is_set():
-                g_connection_lost.wait(timeout=5.0)
+    # --- Timers for Periodic Tasks ---
+    height_check_interval = 15 * 60 # 15 minutes
+    last_height_check_time = time.monotonic()
+    status_log_interval = STATUS_LOG_INTERVAL_SECONDS
+    last_status_log_time = time.monotonic()
 
-            if g_sigint_shutdown.is_set(): logger.info("Main loop notified of shutdown.")
-            elif g_connection_lost.is_set(): logger.warning("Pool connection lost. Preparing to reconnect...")
+    threads = [] # To keep track of running threads
 
-            close_socket()
-            logger.info("Waiting for threads to finish...")
-            join_timeout = 2.0
-            for t in threads: t.join(timeout=join_timeout); # Removed is_alive check log noise
-            threads = []
-            logger.info("Threads stopped/joined.")
+    # --- Main Reconnect Loop ---
+    while not g_shutdown_event.is_set():
+        log_msg(logging.INFO, f"[MAIN] Attempting connection to pool {g_pool_host}:{g_pool_port}...")
+        print(f"[NET] Connecting to {g_pool_host}:{g_pool_port}...")
+        sys.stdout.flush()
 
-            if g_sigint_shutdown.is_set(): break
-            logger.info(f"Waiting {RECONNECT_DELAY_SECONDS}s before reconnecting...")
-            reconnect_wait_interrupted = g_sigint_shutdown.wait(timeout=RECONNECT_DELAY_SECONDS)
-            if reconnect_wait_interrupted: logger.info("Shutdown signal received during reconnect wait."); break
+        # Reset connection lost flag and potentially clear old job data for new attempt
+        g_connection_lost_event.clear()
+        with g_thread_hash_counts_lock:
+            g_thread_hash_counts = [0] * g_threads # Reset counters
+        g_total_hashes_reported = 0
+        g_aggregated_hash_rate = 0.0
+        g_last_aggregated_report_time = time.monotonic()
 
-        else: # Connection failed
-            logger.error(f"Connection failed. Retrying in {RECONNECT_DELAY_SECONDS} seconds...")
-            fail_wait_interrupted = g_sigint_shutdown.wait(timeout=RECONNECT_DELAY_SECONDS)
-            if fail_wait_interrupted: logger.info("Shutdown signal received during connection retry wait."); break
+        # Attempt connection
+        new_socket = connect_pool()
+
+        if new_socket is None:
+            log_msg(logging.WARNING, f"[MAIN] Connection failed. Retrying in {RECONNECT_DELAY_SECONDS} seconds...")
+            print(f"{C_YELLOW}[NET] Connection failed. Retrying in {RECONNECT_DELAY_SECONDS} seconds...{C_RESET}", file=sys.stderr)
+            sys.stderr.flush()
+            # Wait for reconnect delay, but allow shutdown signal to interrupt
+            g_shutdown_event.wait(timeout=RECONNECT_DELAY_SECONDS)
+            if g_shutdown_event.is_set(): break # Exit main loop if shutdown during wait
+            continue # Try connecting again
+
+        # --- Connection Successful ---
+        with g_socket_lock:
+             g_socket = new_socket # Store the valid socket globally
+        log_msg(logging.INFO, f"[MAIN] Connection successful (FD/Socket: {g_socket.fileno()}). Starting threads...")
+        print(f"{C_GREEN}[NET] Connected! Starting {g_threads} worker threads.{C_RESET}")
+        sys.stdout.flush()
+
+        # Reset Global Job State Variables (under lock)
+        with g_job_lock:
+            log_msg(logging.INFO, "[MAIN] Resetting job state for new connection.")
+            g_job_id = None
+            g_prevhash_bin = b''
+            g_coinb1_bin = b''
+            g_coinb2_bin = b''
+            g_merkle_branch_bin_be = []
+            g_version_le = 0
+            g_nbits_le = 0
+            g_ntime_le = 0
+            g_clean_jobs = False
+            g_new_job_available = False
+            g_extranonce1_bin = b''
+            g_extranonce2_size = 4 # Reset to default
+        # Reset Share Target to Diff 1 (pool will send actual difficulty)
+        with g_share_target_lock:
+            g_share_target = TARGET1
+            log_msg(logging.INFO, "[MAIN] Reset share target to Difficulty 1 for new connection.")
+
+        # Start Threads
+        threads = []
+        sub_thread = threading.Thread(target=subscribe_func, name="Subscribe", daemon=True)
+        threads.append(sub_thread)
+        sub_thread.start()
+
+        for i in range(g_threads):
+            miner_thread = threading.Thread(target=miner_func, args=(i, g_threads), name=f"Miner-{i}", daemon=True)
+            threads.append(miner_thread)
+            miner_thread.start()
+
+        # --- Monitor Loop (while connected) ---
+        while not g_shutdown_event.is_set() and not g_connection_lost_event.is_set():
+            # Wait for a short duration or until notified of shutdown/disconnect
+            # Use event wait with timeout
+            signaled = g_shutdown_event.wait(timeout=1.0) # Check every second
+            if signaled or g_connection_lost_event.is_set():
+                break # Exit monitor loop if shutdown or lost connection signaled
+
+             # Perform periodic tasks
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_status_log_time >= status_log_interval:
+                try:
+                    log_periodic_status()
+                except Exception as e: # Catch errors in status logging
+                    log_msg(logging.ERROR, f"[ERROR][STATUS] Error during periodic status log: {e}")
+                last_status_log_time = now_monotonic
+
+            if now_monotonic - last_height_check_time >= height_check_interval:
+                log_msg(logging.INFO, "[MAIN] Performing periodic external height check...")
+                external_height = get_current_block_height()
+                if external_height > 0:
+                    with g_current_height_lock:
+                        local_height = g_current_height
+                        if external_height > local_height:
+                            log_msg(logging.INFO, f"[MAIN] External height {external_height} > local height {local_height}. Updating local height.")
+                            print(f"\n{C_CYAN}[INFO] External height update detected: {external_height}{C_RESET}", flush=True)
+                            g_current_height = external_height # Update atomic height
+                        elif external_height < local_height and local_height > 0:
+                            log_msg(logging.WARNING, f"[WARN][MAIN] External height {external_height} < local height {local_height}. Ignoring minor discrepancy.")
+                else:
+                    log_msg(logging.WARNING, "[WARN][MAIN] Periodic external height check failed.")
+                last_height_check_time = now_monotonic
+
+        # --- End Monitor Loop ---
+
+        # --- Disconnection or Shutdown Detected ---
+        if g_shutdown_event.is_set():
+             log_msg(logging.INFO, "[MAIN] Shutdown requested. Stopping threads...")
+        elif g_connection_lost_event.is_set():
+             log_msg(logging.INFO, "[MAIN] Connection lost detected. Stopping threads and preparing to reconnect...")
+             ts = timestamp_us()
+             print(f"\r{' '*80}\r{C_YELLOW}[{ts}] Pool connection lost. Reconnecting...{C_RESET}", file=sys.stderr, flush=True)
+
+        # --- Coordinated Thread Shutdown ---
+        # 1. Close the socket (this should interrupt blocking reads/selects)
+        closed_socket_fd = -1
+        with g_socket_lock:
+             if g_socket:
+                 closed_socket_fd = g_socket.fileno()
+                 try:
+                     g_socket.shutdown(socket.SHUT_RDWR) # Signal intent to close
+                 except socket.error: pass # Ignore errors if already closed
+                 try:
+                     g_socket.close()
+                     log_msg(logging.INFO, f"[MAIN] Closed socket FD {closed_socket_fd}.")
+                 except socket.error as e:
+                     log_msg(logging.WARNING, f"[MAIN] Error closing socket FD {closed_socket_fd}: {e}")
+                 g_socket = None # Mark global socket as invalid
+
+        # 2. Ensure events are set to signal threads
+        g_connection_lost_event.set() # Ensure this is set
+        g_shutdown_event.set() # Ensure this is set if we are shutting down
+
+        # 3. Notify all waiting threads (miners waiting for jobs)
+        with g_job_lock:
+            g_new_job_condition.notify_all()
+        log_msg(logging.INFO, "[MAIN] Notified condition variable for thread shutdown.")
+
+        # 4. Join threads (with timeout) - Daemon threads might exit anyway, but join is cleaner
+        log_msg(logging.INFO, f"[MAIN] Joining {len(threads)} threads...")
+        join_timeout = 2.0 # Seconds to wait for each thread
+        start_join = time.monotonic()
+        joined_count = 0
+        for t in threads:
+             # Check if current thread before joining
+             if t == threading.current_thread(): continue
+             # Join with timeout
+             t.join(timeout=max(0.1, join_timeout - (time.monotonic() - start_join)))
+             if t.is_alive():
+                 log_msg(logging.WARNING, f"[MAIN] Thread {t.name} did not join within timeout.")
+             else:
+                 log_msg(logging.INFO, f"[MAIN] Thread {t.name} joined.")
+                 joined_count += 1
+        threads.clear()
+        log_msg(logging.INFO, f"[MAIN] Joined {joined_count} threads.")
+
+
+        # --- Prepare for Next Loop Iteration (Reconnect Delay) ---
+        if g_shutdown_event.is_set():
+             log_msg(logging.INFO, "[MAIN] Shutdown confirmed. Exiting main loop.")
+             break # Exit the main reconnect loop
+        else:
+             log_msg(logging.INFO, f"[MAIN] Waiting {RECONNECT_DELAY_SECONDS}s before attempting reconnect...")
+             # Wait, allowing interruption by SIGINT
+             g_shutdown_event.wait(timeout=RECONNECT_DELAY_SECONDS)
+             if g_shutdown_event.is_set(): break # Exit if shutdown during wait
+
+    # --- End Main Reconnect Loop ---
 
     # --- Final Cleanup ---
-    logger.info("Miner shutting down.")
-    # Final message to console might be useful after logging stops
-    print(f"\n\033[92mMiner exiting...\033[0m", file=sys.stderr)
-    close_socket()
-    # Join lingering threads if any (less critical now threads are daemon)
-    # ... (join logic can be simplified or removed if daemons are reliable) ...
-    logger.info("----------------- Miner Exited -----------------")
-    logging.shutdown() # Flush and close handlers
+    log_msg(logging.INFO, "[MAIN] Miner shutting down cleanly.")
+    print(f"\n{C_GREEN}Miner exiting...{C_RESET}")
+    sys.stdout.flush()
+
+    # Log final stats (already done in log_periodic_status, but maybe print one last time)
+    final_rate = g_aggregated_hash_rate
+    final_unit = "H/s"
+    if final_rate >= 1e12: final_rate /= 1e12; final_unit = "TH/s"
+    elif final_rate >= 1e9: final_rate /= 1e9; final_unit = "GH/s"
+    elif final_rate >= 1e6: final_rate /= 1e6; final_unit = "MH/s"
+    elif final_rate >= 1e3: final_rate /= 1e3; final_unit = "kH/s"
+    final_hashes = g_total_hashes_reported # Get last reported total
+
+    print(f"{C_CYAN}Final Status:{C_RESET} Rate={final_rate:.2f} {final_unit} | Total Hashes (approx)={final_hashes}{C_RESET}", flush=True)
+    log_msg(logging.INFO,"----------------- Miner Exited -----------------")
+
+    # Close file handler explicitly if it exists
+    if file_handler:
+        try:
+            file_handler.close()
+            logger.removeHandler(file_handler)
+        except Exception as e:
+             print(f"{C_YELLOW}[WARN] Error closing log file handler: {e}{C_RESET}", file=sys.stderr)
+
 
 if __name__ == "__main__":
+    # Necessary imports for select within subscribe_func if not already global
+    import select
     main()
