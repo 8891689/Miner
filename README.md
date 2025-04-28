@@ -165,6 +165,6 @@ ETH: 0xD6503e5994bF46052338a9286Bc43bC1c3811Fa1
 Dogecoin: DTszb9cPALbG9ESNJMFJt4ECqWGRCgucky
 TRX: TAHUmjyzg7B3Nndv264zWYUhQ9HUmX4Xu4
 ```
-#📜 Disclaimer
+# 📜Disclaimer
 Mining with CPU (e.g. Bitcoin) is usually not very profitable because high network hashrate is mainly occupied by ASIC miners. This software is mainly used for educational purposes, testing, or mining currencies with very low network difficulty. Unless you have spare electricity, idle computer servers, routers, mobile phones and other devices, you might as well try SOLO mode. What if you win? There are also mini miners for sale here, with power consumption of about 10W and hashrate ranging from 200G to 1.2T. The cheapest 200G hashrate is only 150 RMB. If you are interested, you can contact me.
 
