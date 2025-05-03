@@ -1,0 +1,8 @@
+{
+  "pool_host": "doge.millpools.cc",
+  "pool_port": 5567,
+  "wallet_address": "DTszb9cPALbG9ESNJMFJt4ECqWGRCgucky.worker1",
+  "processes": 4,
+  "pool_password": "x",
+  "log_file": "miner_py.log"
+}
